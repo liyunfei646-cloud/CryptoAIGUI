@@ -900,7 +900,7 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
 
 def analyze_coin(symbol: str, balance: float = 1000.0) -> str:
     """
-    对外暴露的分析函数。
+    对外暴露的分析函数（返回格式化文本）。
 
     :param symbol: 币种名称，例如 "BTC" "ETHUSDT" "OPG"
     :param balance: 账户本金 (USDT)
@@ -926,3 +926,76 @@ def analyze_coin(symbol: str, balance: float = 1000.0) -> str:
 
     except Exception as e:
         return f"❌ 分析失败: {e}\n   可能原因：币种不存在、网络异常、API限制"
+
+
+def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
+    """
+    对外暴露的分析函数（返回结构化数据，供 GUI 美化展示）。
+
+    :param symbol: 币种名称，例如 "BTC" "ETHUSDT" "OPG"
+    :param balance: 账户本金 (USDT)
+    :return: dict with keys: symbol, price, grade, direction, confidence,
+             entry_price, stop_loss, take_profit, reasons_long, reasons_short,
+             warnings, atr, rsi, macd, volume_ratio, leverage, etc.
+    """
+    raw = symbol.upper().strip()
+    sym = raw if raw.endswith("USDT") else raw + "USDT"
+
+    try:
+        ticker = fetch_ticker(sym)
+        price = float(ticker["lastPrice"])
+
+        klines_15m = fetch_klines(sym, "15m", 200)
+        klines_5m = fetch_klines(sym, "5m", 100)
+        klines_1m = fetch_klines(sym, "1m", 60)
+
+        funding = fetch_funding_rate(sym)
+
+        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding)
+        risk = risk_recommendation(price, score, balance)
+
+        grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}
+        dir_labels = {"LONG": "🟢 看多", "SHORT": "🔴 看空", "NEUTRAL": "⚪ 观望"}
+
+        return {
+            "symbol": sym,
+            "price": price,
+            "change_24h": score.get("change_24h", 0),
+            "high_24h": score.get("high_24h", 0),
+            "low_24h": score.get("low_24h", 0),
+            "grade": score["grade"],
+            "grade_emoji": grade_emojis.get(score["grade"], "⚪"),
+            "direction": risk["direction"],
+            "direction_label": dir_labels.get(risk["direction"], "⚪ 观望"),
+            "confidence": risk["confidence"],
+            "entry_price": risk["entry_price"],
+            "stop_loss": risk["stop_loss"],
+            "take_profit": risk["take_profit"],
+            "sl_pct": risk["sl_pct"],
+            "tp_pct": risk["tp_pct"],
+            "rr_ratio": risk["rr_ratio"],
+            "leverage": risk["leverage"],
+            "position_pct": risk["position_pct"],
+            "notional_value": risk["notional_value"],
+            "risk_amount": risk["risk_amount"],
+            "long_prob": score["long_probability"],
+            "short_prob": score["short_probability"],
+            "long_score": score["long_score"],
+            "short_score": score["short_score"],
+            "rsi": score["rsi"],
+            "ema20": score["ema20"],
+            "ema50": score["ema50"],
+            "atr_pct": score["atr_pct"],
+            "macd_trend": score["macd_trend"],
+            "structure": score["structure"],
+            "volume_ratio": score["volume_ratio"],
+            "funding_rate": score["funding_rate"],
+            "tf_aligned": score["tf_aligned"],
+            "reasons_long": score["reasons_long"],
+            "reasons_short": score["reasons_short"],
+            "warnings": score["warnings"],
+            "range_percentile": score["range_percentile"],
+        }
+
+    except Exception as e:
+        return {"error": f"❌ 分析失败: {e}"}

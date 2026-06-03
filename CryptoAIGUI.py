@@ -224,21 +224,22 @@ class ResultCard(QFrame):
         esp_layout.setContentsMargins(12, 10, 12, 10)
         esp_layout.setSpacing(6)
 
-        for label_text, key, color in [
-            ("入场价", "entry_price", C['accent']),
-            ("止盈价", "take_profit", C['green']),
-            ("止损价", "stop_loss", C['red']),
-        ]:
+        esp_refs = [
+            ("esp_entry", "入场价", "entry_price", C['accent']),
+            ("esp_tp", "止盈价", "take_profit", C['green']),
+            ("esp_sl", "止损价", "stop_loss", C['red']),
+        ]
+        for attrname, label_text, _, color in esp_refs:
             row = QHBoxLayout()
             l = QLabel(label_text)
             l.setStyleSheet(f"font-size: 13px; color: {C['text2']};")
             row.addWidget(l)
             row.addStretch()
             v = QLabel("—")
-            v.setObjectName(f"esp_{key}")
             v.setStyleSheet(f"font-size: 13px; font-weight: bold; font-family: 'Consolas'; color: {color};")
             row.addWidget(v)
             esp_layout.addLayout(row)
+            setattr(self, attrname, v)
 
         col_a.addWidget(esp)
         body_layout.addLayout(col_a)
@@ -248,21 +249,21 @@ class ResultCard(QFrame):
         col_b.setSpacing(12)
 
         stats = [
-            ("杠杆倍数", "leverage", "2x"),
-            ("建议仓位", "position_pct", "117.6%"),
-            ("名义价值", "notional_value", "$3211.50"),
+            ("st_lev", "杠杆倍数", "2x"),
+            ("st_pos", "建议仓位", "117.6%"),
+            ("st_notional", "名义价值", "$3211.50"),
         ]
-        for label_text, key, _default in stats:
+        for attrname, label_text, _default in stats:
             row = QHBoxLayout()
             l = QLabel(label_text)
             l.setStyleSheet(f"font-size: 13px; color: {C['text2']};")
             row.addWidget(l)
             row.addStretch()
             v = QLabel(_default)
-            v.setObjectName(f"st_{key}")
             v.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {C['text']};")
             row.addWidget(v)
             col_b.addLayout(row)
+            setattr(self, attrname, v)
 
         # Separator
         sep = QFrame()
@@ -271,17 +272,18 @@ class ResultCard(QFrame):
         col_b.addWidget(sep)
 
         # 24h High / Low
-        for label_text, key in [("24h 最高", "high_24h"), ("24h 最低", "low_24h")]:
+        hl_refs = [("hl_high", "24h 最高"), ("hl_low", "24h 最低")]
+        for attrname, label_text in hl_refs:
             row = QHBoxLayout()
             l = QLabel(label_text)
             l.setStyleSheet(f"font-size: 12px; color: {C['text2']};")
             row.addWidget(l)
             row.addStretch()
             v = QLabel("—")
-            v.setObjectName(f"hl_{key}")
             v.setStyleSheet(f"font-size: 12px; font-family: 'Consolas'; color: {C['text']};")
             row.addWidget(v)
             col_b.addLayout(row)
+            setattr(self, attrname, v)
 
         body_layout.addLayout(col_b)
         mc_layout.addWidget(body)
@@ -328,7 +330,7 @@ class ResultCard(QFrame):
 
         # 4-grid indicators
         ind_grid = QFrame()
-        ig = QHBoxLayout(ig := QFrame())
+        ig = QHBoxLayout(ind_grid)
         ig.setSpacing(8)
 
         self._ind_labels = {}
@@ -343,14 +345,12 @@ class ResultCard(QFrame):
             t.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cl.addWidget(t)
             v = QLabel("—")
-            v.setObjectName(f"ind_{key}")
             v.setAlignment(Qt.AlignmentFlag.AlignCenter)
             v.setStyleSheet(f"font-size: 14px; font-weight: bold; font-family: 'Consolas'; color: {C['text']};")
             cl.addWidget(v)
             self._ind_labels[key] = v
             ig.addWidget(cell)
 
-        ind_grid.setLayout(ig)
         ind_layout.addWidget(ind_grid)
         bottom.addWidget(self.indicator_panel)
 
@@ -436,7 +436,7 @@ class ResultCard(QFrame):
 
         # Grade badge
         is_good = grade in ("A", "B")
-        grade_bg = "rgba(162,211,164,0.2)" if is_good else f"rgba({C['red'].replace('#','')},0.2)"
+        grade_bg = "rgba(162,211,164,0.2)" if is_good else f"rgba(255,180,171,0.2)"
         grade_col = C['green'] if is_good else C['red']
         self.grade_badge.setText(grade_name)
         self.grade_badge.setStyleSheet(f"""
@@ -460,33 +460,35 @@ class ResultCard(QFrame):
         conf_color = C['green'] if conf >= 65 else C['amber'] if conf >= 60 else C['text2']
         self.conf_value.setStyleSheet(f"font-size: 13px; font-weight: bold; color: {conf_color};")
 
-        # ESP values
-        for key in ["entry_price", "take_profit", "stop_loss"]:
-            widget = self.findChild(QLabel, f"esp_{key}")
-            if widget:
-                val = d.get(key)
-                if val:
-                    pct = d.get({"entry_price": None, "take_profit": "tp_pct", "stop_loss": "sl_pct"}.get(key, ""))
-                    widget.setText(_fmt_price(val))
+        # ESP values (stored references from _build)
+        esp_keys = {"entry_price": "esp_entry", "take_profit": "esp_tp", "stop_loss": "esp_sl"}
+        for dk, objname in esp_keys.items():
+            w = getattr(self, objname, None)
+            if w:
+                val = d.get(dk)
+                if val is not None:
+                    w.setText(_fmt_price(val))
 
         # Stats
-        for key in ["leverage", "position_pct", "notional_value"]:
-            widget = self.findChild(QLabel, f"st_{key}")
-            if widget:
-                val = d.get(key, 0)
-                if key == "leverage":
-                    widget.setText(f"{val}x")
-                elif key == "position_pct":
-                    widget.setText(f"{val:.1f}%")
-                elif key == "notional_value":
-                    widget.setText(_fmt_price(val))
+        stats_map = {"leverage": "st_lev", "position_pct": "st_pos", "notional_value": "st_notional"}
+        for dk, objname in stats_map.items():
+            w = getattr(self, objname, None)
+            if w:
+                val = d.get(dk, 0)
+                if dk == "leverage":
+                    w.setText(f"{val}x")
+                elif dk == "position_pct":
+                    w.setText(f"{val:.1f}%")
+                elif dk == "notional_value":
+                    w.setText(_fmt_price(val))
 
         # 24h HL
-        for key in ["high_24h", "low_24h"]:
-            widget = self.findChild(QLabel, f"hl_{key}")
-            if widget:
-                val = d.get(key, 0)
-                widget.setText(_fmt_price(val))
+        hl_map = {"high_24h": "hl_high", "low_24h": "hl_low"}
+        for dk, objname in hl_map.items():
+            w = getattr(self, objname, None)
+            if w:
+                val = d.get(dk, 0)
+                w.setText(_fmt_price(val))
 
         # Probability bars
         lp = d.get("long_prob", 50)

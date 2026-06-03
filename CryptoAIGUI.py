@@ -14,15 +14,15 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QTextEdit, QLabel, QStatusBar,
-    QTabWidget, QFrame, QGridLayout
+    QTabWidget, QFrame, QGridLayout, QScrollArea, QSizePolicy
 )
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QFont
 
-from analyzer import analyze_coin_dict
+from analyzer import analyze_coin_dict, fetch_movers
 
 
-# ── 样式常量 ────────────────────────────────────────────────────────────
+# ── 样式 ────────────────────────────────────────────────────────────────
 CARD_STYLE = """
     QFrame#card {
         background-color: #0f3460;
@@ -43,6 +43,30 @@ BTN_STYLE = """
     }
     QPushButton:hover { background-color: #1976D2; }
     QPushButton:disabled { background-color: #90CAF9; }
+"""
+SMALL_BTN = """
+    QPushButton {
+        background-color: #1a5276;
+        color: #90CAF9;
+        border: 1px solid #1565C0;
+        border-radius: 3px;
+        font-size: 11px;
+        padding: 3px 10px;
+    }
+    QPushButton:hover { background-color: #1565C0; color: white; }
+"""
+REFRESH_BTN = """
+    QPushButton {
+        background-color: #2E7D32;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: bold;
+        padding: 6px 16px;
+    }
+    QPushButton:hover { background-color: #388E3C; }
+    QPushButton:disabled { background-color: #558B2F; }
 """
 QUICK_BTN = """
     QPushButton {
@@ -80,10 +104,25 @@ TAB_STYLE = """
         background-color: #1a1a3e;
     }
 """
+COIN_ITEM_STYLE = """
+    QFrame#coin_item {
+        background-color: #0d2137;
+        border: 1px solid #1a3a5c;
+        border-radius: 6px;
+        padding: 8px;
+    }
+    QFrame#coin_item:hover {
+        background-color: #122a45;
+        border: 1px solid #2196F3;
+    }
+"""
 
 
-# ── 后台分析线程 ──────────────────────────────────────────────────────
-class Worker(QThread):
+# ═══════════════════════════════════════════════════════════════════════
+#  后台线程
+# ═══════════════════════════════════════════════════════════════════════
+
+class AnalysisWorker(QThread):
     finished = Signal(dict)
     error = Signal(str)
 
@@ -103,10 +142,24 @@ class Worker(QThread):
             self.error.emit(f"❌ 分析异常: {e}")
 
 
-# ── 结果卡片组件 ──────────────────────────────────────────────────────
-class ResultCard(QFrame):
-    """专业风格的结果展示卡片"""
+class MoversWorker(QThread):
+    finished = Signal(dict)
 
+    def __init__(self, min_volume: float = 500_000, top_n: int = 20):
+        super().__init__()
+        self.min_volume = min_volume
+        self.top_n = top_n
+
+    def run(self):
+        result = fetch_movers(self.min_volume, self.top_n)
+        self.finished.emit(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  分析结果卡片
+# ═══════════════════════════════════════════════════════════════════════
+
+class ResultCard(QFrame):
     def __init__(self):
         super().__init__()
         self.setObjectName("card")
@@ -118,7 +171,6 @@ class ResultCard(QFrame):
         layout.setSpacing(10)
         layout.setContentsMargins(16, 14, 16, 14)
 
-        # 行 0: 币种 + 等级
         self.symbol_label = QLabel("—")
         self.symbol_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #E3F2FD;")
         layout.addWidget(self.symbol_label, 0, 0)
@@ -128,13 +180,11 @@ class ResultCard(QFrame):
         self.grade_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.grade_label, 0, 1)
 
-        # 分隔线
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color: #1a5276;")
         layout.addWidget(sep, 1, 0, 1, 2)
 
-        # 行 2: 方向 + 置信度
         self.dir_label = QLabel("方向: —")
         self.dir_label.setStyleSheet("font-size: 16px; color: #B0BEC5;")
         layout.addWidget(self.dir_label, 2, 0)
@@ -144,22 +194,18 @@ class ResultCard(QFrame):
         self.conf_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.conf_label, 2, 1)
 
-        # 行 3: 入场价
         self.entry_label = QLabel("入场价: —")
         self.entry_label.setStyleSheet("font-size: 15px; color: #E0E0E0;")
         layout.addWidget(self.entry_label, 3, 0)
 
-        # 行 4: 止损价
         self.sl_label = QLabel("止损价: —")
         self.sl_label.setStyleSheet("font-size: 15px; color: #EF9A9A;")
         layout.addWidget(self.sl_label, 4, 0)
 
-        # 行 5: 止盈价
         self.tp_label = QLabel("止盈价: —")
         self.tp_label.setStyleSheet("font-size: 15px; color: #A5D6A7;")
         layout.addWidget(self.tp_label, 5, 0)
 
-        # 行 6: 杠杆 + 仓位
         self.lev_label = QLabel("建议杠杆: —")
         self.lev_label.setStyleSheet("font-size: 14px; color: #90CAF9;")
         layout.addWidget(self.lev_label, 6, 0)
@@ -169,7 +215,6 @@ class ResultCard(QFrame):
         self.pos_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.pos_label, 6, 1)
 
-        # 行 7: 24h涨跌
         self.price_label = QLabel("")
         self.price_label.setStyleSheet("font-size: 13px; color: #78909C;")
         layout.addWidget(self.price_label, 7, 0, 1, 2)
@@ -177,14 +222,11 @@ class ResultCard(QFrame):
         self.setLayout(layout)
 
     def update_data(self, d: dict):
-        """用分析结果填充卡片"""
         price = d.get("price", 0)
         symbol = d.get("symbol", "").replace("USDT", "")
 
-        # 币种
         self.symbol_label.setText(f"{symbol}  ${price:,.4f}")
 
-        # 等级
         grade = d.get("grade", "D")
         emoji = d.get("grade_emoji", "⚪")
         grade_colors = {
@@ -197,34 +239,29 @@ class ResultCard(QFrame):
         self.grade_label.setText(f"{emoji} {grade} — {grade_names.get(grade, '—')}")
         self.grade_label.setStyleSheet(f"font-size: 20px; padding: 2px 10px; border-radius: 4px; {grade_colors.get(grade, grade_colors['D'])}")
 
-        # 方向
         direction = d.get("direction", "NEUTRAL")
         dir_colors = {"LONG": "#A5D6A7", "SHORT": "#EF9A9A", "NEUTRAL": "#B0BEC5"}
         self.dir_label.setText(f"方向: {d.get('direction_label', '⚪ 观望')}")
         self.dir_label.setStyleSheet(f"font-size: 16px; color: {dir_colors.get(direction, '#B0BEC5')};")
 
-        # 置信度
         conf = d.get("confidence", 0)
         self.conf_label.setText(f"置信度: {conf:.1f}%")
         conf_color = "#C8E6C9" if conf >= 65 else "#FFE0B2" if conf >= 60 else "#B0BEC5"
         self.conf_label.setStyleSheet(f"font-size: 16px; color: {conf_color};")
 
-        # 入场/止损/止盈
         entry_fmt = f"${d['entry_price']:,.6f}" if d.get("entry_price") else "—"
-        sl_fmt = f"${d['stop_loss']:,.6f}  ({'-' if d['stop_loss'] else ''}{d.get('sl_pct', 0):.2f}%)" if d.get("stop_loss") else "—"
-        tp_fmt = f"${d['take_profit']:,.6f}  ({'+' if d['take_profit'] else ''}{d.get('tp_pct', 0):.2f}%)" if d.get("take_profit") else "—"
+        sl_fmt = f"${d['stop_loss']:,.6f}  ({d.get('sl_pct', 0):.2f}%)" if d.get("stop_loss") else "—"
+        tp_fmt = f"${d['take_profit']:,.6f}  ({d.get('tp_pct', 0):.2f}%)" if d.get("take_profit") else "—"
 
         self.entry_label.setText(f"入场价:  {entry_fmt}")
         self.sl_label.setText(f"止损价:  {sl_fmt}")
         self.tp_label.setText(f"止盈价:  {tp_fmt}")
 
-        # 杠杆+仓位
         lev = d.get("leverage", 0)
         pct = d.get("position_pct", 0)
         self.lev_label.setText(f"建议杠杆: {lev}x")
         self.pos_label.setText(f"仓位: {pct:.1f}%  (${d.get('notional_value', 0):,.2f})")
 
-        # 24h价格变化
         change = d.get("change_24h", 0)
         h24 = d.get("high_24h", 0)
         l24 = d.get("low_24h", 0)
@@ -233,10 +270,11 @@ class ResultCard(QFrame):
         self.price_label.setTextFormat(Qt.TextFormat.RichText)
 
 
-# ── 详细分析文本区 ──────────────────────────────────────────────────────
-class DetailPanel(QTextEdit):
-    """显示详细的指标理由和风险提示"""
+# ═══════════════════════════════════════════════════════════════════════
+#  详细分析文本区
+# ═══════════════════════════════════════════════════════════════════════
 
+class DetailPanel(QTextEdit):
     def __init__(self):
         super().__init__()
         self.setReadOnly(True)
@@ -255,7 +293,6 @@ class DetailPanel(QTextEdit):
     def update_data(self, d: dict):
         parts = []
 
-        # ── 多空概率 ──
         lp = d.get("long_prob", 50)
         sp = d.get("short_prob", 50)
         long_bars = int(lp / 5)
@@ -265,14 +302,12 @@ class DetailPanel(QTextEdit):
         parts.append(f"   🔴 做空: {sp:.1f}%  {'■' * short_bars}")
         parts.append("")
 
-        # ── 技术指标 ──
         parts.append("📈 技术指标")
         parts.append(f"   RSI(14): {d.get('rsi', '—')}  |  ATR: {d.get('atr_pct', 0):.2f}%  |  MACD: {d.get('macd_trend', '—')}")
         parts.append(f"   结构: {d.get('structure', '—')}  |  量比: x{d.get('volume_ratio', 0):.1f}  |  资金费率: {d.get('funding_rate', 0):+.6f}")
         parts.append(f"   共振: {'✅ 多TF一致' if d.get('tf_aligned') else '❌ TF分化'}")
         parts.append("")
 
-        # ── 做多理由 ──
         reasons_l = d.get("reasons_long", [])
         if reasons_l:
             parts.append(f"🟢 做多理由 ({d.get('long_score', 0)}分)")
@@ -280,7 +315,6 @@ class DetailPanel(QTextEdit):
                 parts.append(f"   ✓ {r}")
             parts.append("")
 
-        # ── 做空理由 ──
         reasons_s = d.get("reasons_short", [])
         if reasons_s:
             parts.append(f"🔴 做空理由 ({d.get('short_score', 0)}分)")
@@ -288,7 +322,6 @@ class DetailPanel(QTextEdit):
                 parts.append(f"   ✓ {r}")
             parts.append("")
 
-        # ── 风险提示 ──
         warnings = d.get("warnings", [])
         if warnings:
             parts.append("⚠️ 风险提示")
@@ -296,21 +329,21 @@ class DetailPanel(QTextEdit):
                 parts.append(f"   · {w}")
             parts.append("")
 
-        # ── 盈亏比 ──
         rr = d.get("rr_ratio")
         if rr:
             parts.append(f"📐 盈亏比: 1:{rr}")
-            parts.append("")
 
         self.setText("\n".join(parts))
+        self.verticalScrollBar().setValue(0)
 
 
-# ── 分析页面（Tab 1） ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  分析页面（Tab 1）
+# ═══════════════════════════════════════════════════════════════════════
+
 class AnalysisPage(QWidget):
-    """分析页面：输入 + 结果卡片 + 详细分析"""
-
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self._worker = None
         self._build_ui()
 
@@ -319,7 +352,6 @@ class AnalysisPage(QWidget):
         layout.setSpacing(10)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # ── 输入行 ──
         input_layout = QHBoxLayout()
         self.coin_input = QLineEdit()
         self.coin_input.setPlaceholderText("请输入币种，例如 BTC / ETH / SOL / OPG")
@@ -335,7 +367,6 @@ class AnalysisPage(QWidget):
         input_layout.addWidget(self.analyze_btn, stretch=1)
         layout.addLayout(input_layout)
 
-        # ── 快捷按钮 ──
         quick_layout = QHBoxLayout()
         quick_layout.setSpacing(6)
         for coin in ["BTC", "ETH", "SOL", "OPG", "DOGE", "BNB"]:
@@ -347,25 +378,26 @@ class AnalysisPage(QWidget):
         quick_layout.addStretch()
         layout.addLayout(quick_layout)
 
-        # ── 结果卡片 ──
         self.card = ResultCard()
         layout.addWidget(self.card)
 
-        # ── 详细分析 ──
         self.detail = DetailPanel()
         layout.addWidget(self.detail, stretch=1)
 
-        # ── 状态标签 ──
         self.status_label = QLabel("就绪 ✅")
         self.status_label.setStyleSheet("color: #888; font-size: 12px;")
         layout.addWidget(self.status_label)
 
         self.setLayout(layout)
 
-        # ── 信号绑定 ──
         self.analyze_btn.clicked.connect(self.run_analysis)
 
     def _quick_coin(self, coin: str):
+        self.coin_input.setText(coin)
+        self.run_analysis()
+
+    def analyze_coin(self, coin: str):
+        """外部调用（从涨幅/跌幅榜跳转）"""
         self.coin_input.setText(coin)
         self.run_analysis()
 
@@ -379,7 +411,7 @@ class AnalysisPage(QWidget):
         self.analyze_btn.setText("⏳ 分析中...")
         self.status_label.setText(f"⏳ 正在获取 {coin.upper()} 数据...")
 
-        self._worker = Worker(coin)
+        self._worker = AnalysisWorker(coin)
         self._worker.finished.connect(self._on_result)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -398,50 +430,305 @@ class AnalysisPage(QWidget):
         self.status_label.setText("❌ 分析失败")
 
 
-# ── 涨幅榜页面（Tab 2） ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+#  涨幅/跌幅榜单个币条目
+# ═══════════════════════════════════════════════════════════════════════
+
+class CoinItem(QFrame):
+    """单个币的行条目"""
+    clicked = Signal(str)  # 发送币种名称
+
+    def __init__(self, rank: int, symbol: str, price: float,
+                 change_pct: float, volume: float, is_gainer: bool):
+        super().__init__()
+        self.setObjectName("coin_item")
+        self.setStyleSheet(COIN_ITEM_STYLE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 6, 10, 6)
+
+        # 排名
+        rank_label = QLabel(f"#{rank}")
+        rank_label.setFixedWidth(32)
+        rank_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #78909C;")
+        layout.addWidget(rank_label)
+
+        # 币种名
+        coin_name = symbol.replace("USDT", "")
+        name_label = QLabel(coin_name)
+        name_label.setFixedWidth(85)
+        name_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #E3F2FD;")
+        layout.addWidget(name_label)
+
+        # 价格
+        price_str = f"${price:,.6f}" if price < 1 else f"${price:,.2f}" if price < 10000 else f"${price:,.0f}"
+        price_label = QLabel(price_str)
+        price_label.setFixedWidth(110)
+        price_label.setStyleSheet("font-size: 13px; color: #B0BEC5;")
+        layout.addWidget(price_label)
+
+        # 涨跌幅
+        chg_color = "#A5D6A7" if change_pct > 0 else "#EF9A9A"
+        chg_label = QLabel(f"{change_pct:+.2f}%")
+        chg_label.setFixedWidth(80)
+        chg_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        chg_label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {chg_color};")
+        layout.addWidget(chg_label)
+
+        # 成交量
+        vol_label = QLabel(f"${volume:.1f}M")
+        vol_label.setFixedWidth(75)
+        vol_label.setStyleSheet("font-size: 11px; color: #546E7A;")
+        layout.addWidget(vol_label)
+
+        layout.addStretch()
+
+        # 分析按钮
+        analyze_btn = QPushButton("分析")
+        analyze_btn.setStyleSheet(SMALL_BTN)
+        analyze_btn.clicked.connect(lambda: self.clicked.emit(coin_name))
+        layout.addWidget(analyze_btn)
+
+        self.setLayout(layout)
+
+        # 点击条目本身也触发
+        self.mouseReleaseEvent = lambda e: self.clicked.emit(coin_name)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  涨幅榜页面（Tab 2）
+# ═══════════════════════════════════════════════════════════════════════
+
 class GainersPage(QWidget):
-    def __init__(self):
+    def __init__(self, on_analyze=None):
         super().__init__()
+        self.on_analyze = on_analyze
+        self._worker = None
+        self._build_ui()
+
+    def _build_ui(self):
         layout = QVBoxLayout()
-        label = QLabel("📈 涨幅榜")
-        label.setStyleSheet("font-size: 18px; color: #A5D6A7; font-weight: bold;")
-        layout.addWidget(label)
-        hint = QLabel("功能开发中，敬请期待...")
-        hint.setStyleSheet("color: #78909C; font-size: 14px;")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(hint, stretch=1, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        top_layout = QHBoxLayout()
+        title = QLabel("📈 涨幅榜 TOP 20")
+        title.setStyleSheet("font-size: 18px; color: #A5D6A7; font-weight: bold;")
+        top_layout.addWidget(title)
+
+        top_layout.addStretch()
+
+        self.refresh_btn = QPushButton("🔄 刷新")
+        self.refresh_btn.setStyleSheet(REFRESH_BTN)
+        self.refresh_btn.clicked.connect(self.refresh)
+        self.refresh_btn.setFixedHeight(30)
+        top_layout.addWidget(self.refresh_btn)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #78909C; font-size: 11px;")
+        top_layout.addWidget(self.status_label)
+
+        layout.addLayout(top_layout)
+
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        self.list_widget = QWidget()
+        self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setSpacing(4)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.addStretch()
+
+        scroll.setWidget(self.list_widget)
+        layout.addWidget(scroll, stretch=1)
+
+        # 加载提示
+        self.hint_label = QLabel("点击「刷新」加载涨幅榜...")
+        self.hint_label.setStyleSheet("color: #546E7A; font-size: 14px;")
+        self.hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.list_layout.insertWidget(0, self.hint_label)
+
         self.setLayout(layout)
 
+    def refresh(self):
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("⏳ 加载中...")
+        self.status_label.setText("正在获取数据...")
 
-# ── 跌幅榜页面（Tab 3） ───────────────────────────────────────────────
+        # 移除旧条目（保留hint）
+        for i in reversed(range(self.list_layout.count())):
+            item = self.list_layout.itemAt(i)
+            if item.widget() and item.widget() != self.hint_label:
+                item.widget().deleteLater()
+
+        self._worker = MoversWorker()
+        self._worker.finished.connect(self._on_data)
+        self._worker.start()
+
+    def _on_data(self, data: dict):
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("🔄 刷新")
+
+        if data.get("error"):
+            self.status_label.setText(f"❌ {data['error']}")
+            self.hint_label.setText(f"加载失败: {data['error']}")
+            self.hint_label.show()
+            return
+
+        gainers = data.get("gainers", [])
+        if not gainers:
+            self.status_label.setText("暂无数据")
+            self.hint_label.show()
+            return
+
+        self.hint_label.hide()
+
+        for i, coin in enumerate(gainers):
+            item = CoinItem(
+                rank=i + 1,
+                symbol=coin["symbol"],
+                price=coin["price"],
+                change_pct=coin["change_pct"],
+                volume=coin["volume"],
+                is_gainer=True,
+            )
+            item.clicked.connect(self._on_coin_click)
+            # 插入到 stretch 前面
+            self.list_layout.insertWidget(self.list_layout.count() - 1, item)
+
+        self.status_label.setText(f"✅ {len(gainers)} 个币种  ({datetime.now():%H:%M})")
+
+    def _on_coin_click(self, coin: str):
+        if self.on_analyze:
+            self.on_analyze(coin)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  跌幅榜页面（Tab 3）
+# ═══════════════════════════════════════════════════════════════════════
+
 class LosersPage(QWidget):
-    def __init__(self):
+    def __init__(self, on_analyze=None):
         super().__init__()
+        self.on_analyze = on_analyze
+        self._worker = None
+        self._build_ui()
+
+    def _build_ui(self):
         layout = QVBoxLayout()
-        label = QLabel("📉 跌幅榜")
-        label.setStyleSheet("font-size: 18px; color: #EF9A9A; font-weight: bold;")
-        layout.addWidget(label)
-        hint = QLabel("功能开发中，敬请期待...")
-        hint.setStyleSheet("color: #78909C; font-size: 14px;")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(hint, stretch=1, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        top_layout = QHBoxLayout()
+        title = QLabel("📉 跌幅榜 TOP 20")
+        title.setStyleSheet("font-size: 18px; color: #EF9A9A; font-weight: bold;")
+        top_layout.addWidget(title)
+
+        top_layout.addStretch()
+
+        self.refresh_btn = QPushButton("🔄 刷新")
+        self.refresh_btn.setStyleSheet(REFRESH_BTN)
+        self.refresh_btn.clicked.connect(self.refresh)
+        self.refresh_btn.setFixedHeight(30)
+        top_layout.addWidget(self.refresh_btn)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #78909C; font-size: 11px;")
+        top_layout.addWidget(self.status_label)
+
+        layout.addLayout(top_layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        self.list_widget = QWidget()
+        self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setSpacing(4)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.addStretch()
+
+        scroll.setWidget(self.list_widget)
+        layout.addWidget(scroll, stretch=1)
+
+        self.hint_label = QLabel("点击「刷新」加载跌幅榜...")
+        self.hint_label.setStyleSheet("color: #546E7A; font-size: 14px;")
+        self.hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.list_layout.insertWidget(0, self.hint_label)
+
         self.setLayout(layout)
 
+    def refresh(self):
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("⏳ 加载中...")
+        self.status_label.setText("正在获取数据...")
 
-# ── 主窗口 ────────────────────────────────────────────────────────────
+        for i in reversed(range(self.list_layout.count())):
+            item = self.list_layout.itemAt(i)
+            if item.widget() and item.widget() != self.hint_label:
+                item.widget().deleteLater()
+
+        self._worker = MoversWorker()
+        self._worker.finished.connect(self._on_data)
+        self._worker.start()
+
+    def _on_data(self, data: dict):
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("🔄 刷新")
+
+        if data.get("error"):
+            self.status_label.setText(f"❌ {data['error']}")
+            self.hint_label.setText(f"加载失败: {data['error']}")
+            self.hint_label.show()
+            return
+
+        losers = data.get("losers", [])
+        if not losers:
+            self.status_label.setText("暂无数据")
+            self.hint_label.show()
+            return
+
+        self.hint_label.hide()
+
+        for i, coin in enumerate(losers):
+            item = CoinItem(
+                rank=i + 1,
+                symbol=coin["symbol"],
+                price=coin["price"],
+                change_pct=coin["change_pct"],
+                volume=coin["volume"],
+                is_gainer=False,
+            )
+            item.clicked.connect(self._on_coin_click)
+            self.list_layout.insertWidget(self.list_layout.count() - 1, item)
+
+        self.status_label.setText(f"✅ {len(losers)} 个币种  ({datetime.now():%H:%M})")
+
+    def _on_coin_click(self, coin: str):
+        if self.on_analyze:
+            self.on_analyze(coin)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  主窗口
+# ═══════════════════════════════════════════════════════════════════════
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CryptoAI — 币安信号雷达")
-        self.resize(720, 780)
-        self.setMinimumSize(520, 580)
+        self.resize(750, 800)
+        self.setMinimumSize(520, 600)
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout()
         layout.setSpacing(8)
 
-        # ── 标题 ──
         title = QLabel("🦐 币安超短线信号雷达")
         title_font = QFont()
         title_font.setPointSize(16)
@@ -450,16 +737,28 @@ class MainWindow(QWidget):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        # ── Tab 页 ──
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(TAB_STYLE)
 
-        self.tabs.addTab(AnalysisPage(), "🔍 分析")
-        self.tabs.addTab(GainersPage(), "📈 涨幅榜")
-        self.tabs.addTab(LosersPage(), "📉 跌幅榜")
+        # 分析页
+        self.analysis_page = AnalysisPage()
+        self.tabs.addTab(self.analysis_page, "🔍 分析")
+
+        # 涨幅榜（点击跳转到分析页）
+        self.gainers_page = GainersPage(on_analyze=self._switch_to_analyze)
+        self.tabs.addTab(self.gainers_page, "📈 涨幅榜")
+
+        # 跌幅榜
+        self.losers_page = LosersPage(on_analyze=self._switch_to_analyze)
+        self.tabs.addTab(self.losers_page, "📉 跌幅榜")
 
         layout.addWidget(self.tabs, stretch=1)
         self.setLayout(layout)
+
+    def _switch_to_analyze(self, coin: str):
+        """从涨幅/跌幅榜跳转到分析页"""
+        self.tabs.setCurrentIndex(0)
+        self.analysis_page.analyze_coin(coin)
 
 
 def main():
@@ -481,6 +780,19 @@ def main():
         }
         QLineEdit:focus {
             border: 1px solid #2196F3;
+        }
+        QScrollBar:vertical {
+            background: #0f3460;
+            width: 8px;
+            border-radius: 4px;
+        }
+        QScrollBar::handle:vertical {
+            background: #1a5276;
+            border-radius: 4px;
+            min-height: 30px;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
         }
     """)
 

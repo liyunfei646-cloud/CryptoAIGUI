@@ -94,6 +94,46 @@ def fetch_funding_rate(symbol: str) -> dict:
         return {"funding_rate": 0, "signal": "neutral"}
 
 
+def fetch_movers(min_volume: float = 500_000, top_n: int = 20) -> dict:
+    """
+    获取所有USDT交易对，按24h涨幅排序，返回{涨幅榜, 跌幅榜}。
+    min_volume: 最低成交额过滤(USDT)
+    """
+    try:
+        data = json.loads(_http_get("https://api.binance.com/api/v3/ticker/24hr").decode("utf-8"))
+        usdt = [t for t in data if t["symbol"].endswith("USDT")
+                 and float(t["quoteVolume"]) > min_volume]
+        usdt.sort(key=lambda t: float(t["priceChangePercent"]), reverse=True)
+
+        gainers = []
+        for t in usdt[:top_n]:
+            gainers.append({
+                "symbol": t["symbol"],
+                "price": float(t["lastPrice"]),
+                "change_pct": round(float(t["priceChangePercent"]), 2),
+                "volume": round(float(t["quoteVolume"]) / 1e6, 2),
+                "high": float(t["highPrice"]),
+                "low": float(t["lowPrice"]),
+            })
+
+        losers_all = usdt[-top_n:]
+        losers_all.reverse()
+        losers = []
+        for t in losers_all:
+            losers.append({
+                "symbol": t["symbol"],
+                "price": float(t["lastPrice"]),
+                "change_pct": round(float(t["priceChangePercent"]), 2),
+                "volume": round(float(t["quoteVolume"]) / 1e6, 2),
+                "high": float(t["highPrice"]),
+                "low": float(t["lowPrice"]),
+            })
+
+        return {"gainers": gainers, "losers": losers, "error": None}
+    except Exception as e:
+        return {"gainers": [], "losers": [], "error": str(e)}
+
+
 def ema(values: list[float], period: int) -> float:
     if len(values) < period:
         return values[-1]

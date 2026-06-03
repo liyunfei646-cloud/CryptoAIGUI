@@ -664,7 +664,7 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         short_score -= VOLATILITY_DECAY // 2
 
     # ── 计算概率 ──
-    max_possible = 140
+    max_possible = 100
     net_score = long_score - short_score
     long_prob_raw = 50.0 + (net_score / max_possible) * 50.0
     long_prob = round(max(5, min(95, long_prob_raw)), 1)

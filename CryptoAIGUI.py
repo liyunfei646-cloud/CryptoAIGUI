@@ -378,7 +378,7 @@ class ResultCard(QFrame):
             }}
         """)
         self.logic_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.logic_text.setFixedHeight(220)
+        self.logic_text.setFixedHeight(160)
         logic_layout.addWidget(self.logic_text)
 
         # Risk/Reward row

@@ -758,6 +758,60 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     }
 
 
+def format_gui_details(d: dict) -> str:
+    """
+    GUI 多空逻辑详细文本（后端生成，前端直接 setText）
+    接收 analyze_coin_dict 返回的 dict。
+    """
+    parts = []
+
+    ema20 = d.get("ema20", 0)
+    ema50 = d.get("ema50", 0)
+    rsi_val = d.get("rsi", "—")
+    parts.append(f"📈 技术指标")
+    parts.append(f"   RSI(14): {rsi_val}  |  EMA20: ${ema20:,.4f}  |  EMA50: ${ema50:,.4f}")
+    parts.append(f"   结构: {d.get('structure','—')}  |  ATR: {d.get('atr_pct',0):.2f}%  |  MACD: {d.get('macd_trend','—').capitalize()}")
+    funding = d.get('funding_rate', 0)
+    aligned = d.get('tf_aligned', False)
+    parts.append(f"   量比: x{d.get('volume_ratio',0):.1f}  |  资金费率: {funding:+.6f}  |  共振: {'✅' if aligned else '❌'}")
+
+    fib = d.get('fib_nearest')
+    if fib:
+        parts.append(f"   Fib靠近: {fib}")
+
+    rp = d.get('range_percentile')
+    rm = d.get('rr_metric', '-')
+    if rp is not None:
+        parts.append(f"   区间百分位: {rp:.0f}%  |  S/R盈亏比: {rm}")
+
+    support = d.get('support')
+    resistance = d.get('resistance')
+    if support and resistance:
+        sup_d = d.get('sup_dist_pct', 0)
+        res_d = d.get('res_dist_pct', 0)
+        parts.append(f"   S/R: 支撑 ${support:,.4f} (-{sup_d}%)  |  阻力 ${resistance:,.4f} (+{res_d}%)")
+
+    parts.append("")
+
+    long_score = d.get("long_score", 0)
+    long_reasons = d.get("reasons_long", [])
+    parts.append(f"🟢 做多理由 ({long_score}分)")
+    for r in long_reasons:
+        parts.append(f"  ✓ {r}")
+    parts.append("")
+
+    short_score = d.get("short_score", 0)
+    short_reasons = d.get("reasons_short", [])
+    parts.append(f"🔴 做空理由 ({short_score}分)")
+    for r in short_reasons:
+        parts.append(f"  ✓ {r}")
+
+    for w in d.get("warnings", []):
+        parts.append(f"\n⚡ {w}")
+
+    return "\n".join(parts if len(parts) > 2 else ["💡 正在计算指标多空强弱逻辑..."])
+
+
 def risk_recommendation(price: float, score_result: dict, account_balance: float = 1000.0) -> dict:
     atr_pct = score_result["atr_pct"]
     long_prob = score_result["long_probability"]

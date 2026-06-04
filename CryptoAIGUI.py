@@ -378,7 +378,7 @@ class ResultCard(QFrame):
             }}
         """)
         self.logic_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.logic_text.setFixedHeight(120)
+        self.logic_text.setFixedHeight(400)
         logic_layout.addWidget(self.logic_text)
 
         # Risk/Reward row
@@ -522,16 +522,55 @@ class ResultCard(QFrame):
                 self._ind_labels[key].setText(val)
                 self._ind_labels[key].setStyleSheet(f"font-size: 14px; font-weight: bold; font-family: 'Consolas'; color: {color};")
 
-        # Logic text
-        reasons = d.get("reasons_long", []) + d.get("reasons_short", [])
-        warnings = d.get("warnings", [])
+        # Logic text — 详细版（类似脚本输出）
         parts = []
-        for i, r in enumerate(reasons[:4]):
-            icon = "✅" if i < 2 else "⚠️"
-            parts.append(f"{icon} {r}")
-        for w in warnings[:3]:
-            parts.append(f"⚡ {w}")
-        if not parts:
+
+        # 技术指标
+        ema20 = d.get("ema20", 0)
+        ema50 = d.get("ema50", 0)
+        rsi_val = d.get("rsi", "—")
+        parts.append(f"📈 技术指标")
+        parts.append(f"   RSI(14): {rsi_val}  |  EMA20: ${ema20:,.4f}  |  EMA50: ${ema50:,.4f}")
+        parts.append(f"   结构: {d.get('structure','—')}  |  ATR: {d.get('atr_pct',0):.2f}%  |  MACD: {d.get('macd_trend','—').capitalize()}")
+        funding = d.get('funding_rate', 0)
+        aligned = d.get('tf_aligned', False)
+        parts.append(f"   量比: x{d.get('volume_ratio',0):.1f}  |  资金费率: {funding:+.6f}  |  共振: {'✅' if aligned else '❌'}")
+        fib = d.get('fib_nearest')
+        if fib:
+            parts.append(f"   Fib靠近: {fib}")
+        rp = d.get('range_percentile')
+        rm = d.get('rr_metric', '-')
+        if rp is not None:
+            parts.append(f"   区间百分位: {rp:.0f}%  |  S/R盈亏比: {rm}")
+        support = d.get('support')
+        resistance = d.get('resistance')
+        if support and resistance:
+            sup_d = d.get('sup_dist_pct', 0)
+            res_d = d.get('res_dist_pct', 0)
+            parts.append(f"   S/R: 支撑 ${support:,.4f} (-{sup_d}%)  |  阻力 ${resistance:,.4f} (+{res_d}%)")
+        parts.append("")
+
+        # 做多理由
+        long_score = d.get("long_score", 0)
+        long_reasons = d.get("reasons_long", [])
+        parts.append(f"🟢 做多理由 ({long_score}分)")
+        for r in long_reasons:
+            parts.append(f"  ✓ {r}")
+        parts.append("")
+
+        # 做空理由
+        short_score = d.get("short_score", 0)
+        short_reasons = d.get("reasons_short", [])
+        parts.append(f"🔴 做空理由 ({short_score}分)")
+        for r in short_reasons:
+            parts.append(f"  ✓ {r}")
+
+        # 警告
+        warnings = d.get("warnings", [])
+        for w in warnings:
+            parts.append(f"\n⚡ {w}")
+
+        if len(parts) <= 2:
             parts.append("💡 正在计算指标多空强弱逻辑...")
         self.logic_text.setText("\n".join(parts))
 

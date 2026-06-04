@@ -1035,6 +1035,12 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "reasons_short": score["reasons_short"],
             "warnings": score["warnings"],
             "range_percentile": score["range_percentile"],
+            "fib_nearest": score.get("fib_nearest"),
+            "rr_metric": score.get("rr_metric", "-"),
+            "support": score.get("support"),
+            "resistance": score.get("resistance"),
+            "sup_dist_pct": score.get("sup_dist_pct"),
+            "res_dist_pct": score.get("res_dist_pct"),
         }
 
     except Exception as e:

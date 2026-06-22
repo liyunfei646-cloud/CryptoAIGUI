@@ -788,6 +788,10 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "change_24h": round(change_24h, 2),
         "whale_score": round(ws, 1) if ws else 50.0,
         "whale_grade_label": whale_result.get("grade_label", "中性 ➖") if ws else "中性 ➖",
+        "whale_factors": {
+            fname: {"score": f["score"], "detail": f["detail"][:40]}
+            for fname, f in whale_result.get("factors", {}).items()
+        } if ws else {},
     }
 
 
@@ -828,6 +832,20 @@ def format_gui_details(d: dict) -> str:
     wl = d.get("whale_grade_label", "中性 ➖")
     ws_emoji = "🔴" if ws < 40 else ("🟢" if ws > 60 else "⚪")
     parts.append(f"   🐋 巨鲸评分: {ws:.0f}/100 {wl}")
+    factors = d.get("whale_factors", {})
+    factor_map = {
+        "exchange": ("交易所资金流", "30%"),
+        "holding": ("巨鲸持仓", "25%"),
+        "transfer": ("大额转账", "15%"),
+        "concentration": ("持仓集中度", "10%"),
+        "smart_money": ("聪明钱", "20%"),
+    }
+    for fkey, (flabel, fweight) in factor_map.items():
+        f = factors.get(fkey, {})
+        fs = f.get("score", 50)
+        fd = f.get("detail", "")
+        f_emoji = "🔴" if fs < 40 else ("🟢" if fs > 60 else "⚪")
+        parts.append(f"     {f_emoji} {flabel} {fs}分 ({fweight}) {fd}")
 
     parts.append("")
 
@@ -994,7 +1012,26 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
         bars_ws = int(ws / 10)
         ws_emoji = "🐋🔴" if ws < 40 else ("🐋🟢" if ws > 60 else "🐋⚪")
         lines.append(f"  {ws_emoji} 巨鲸评分: {ws:.0f}/100  {wl}")
-        lines.append(f"     {'■' * bars_ws}{'░' * (10 - bars_ws)}  ")
+        lines.append(f"     {'■' * bars_ws}{'░' * (10 - bars_ws)}")
+        # 5因子详细分解
+        factor_map = {
+            "exchange": ("🏦 交易所资金流", "30%"),
+            "holding": ("🐳 巨鲸持仓", "25%"),
+            "transfer": ("🔄 大额转账", "15%"),
+            "concentration": ("🎯 持仓集中度", "10%"),
+            "smart_money": ("🧠 聪明钱", "20%"),
+        }
+        factors = score.get("whale_factors", {})
+        for fkey, (flabel, fweight) in factor_map.items():
+            f = factors.get(fkey, {})
+            fs = f.get("score", 50)
+            fd = f.get("detail", "")
+            f_bars = int(fs / 10)
+            f_emoji = "🔴" if fs < 40 else ("🟢" if fs > 60 else "⚪")
+            if fd:
+                lines.append(f"     {f_emoji} {flabel:<10} {fs:3d} {fweight}  {fd}")
+            else:
+                lines.append(f"     {f_emoji} {flabel:<10} {fs:3d} {fweight}  —")
 
     lines.append("")
     if score["reasons_long"]:
@@ -1159,6 +1196,7 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "res_dist_pct": score.get("res_dist_pct"),
             "whale_score": score.get("whale_score", 50.0),
             "whale_grade_label": score.get("whale_grade_label", "中性 ➖"),
+            "whale_factors": score.get("whale_factors", {}),
         }
 
     except Exception as e:

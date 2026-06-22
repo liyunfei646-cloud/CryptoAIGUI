@@ -13,6 +13,9 @@ import ssl
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
+# ─── Whale Score 引擎 ────────────────────────────────────────────────
+from whale_score_engine import calc_whale_score, WEIGHTS
+
 # ─── 配置 ────────────────────────────────────────────────────────────────
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUTURES = "https://fapi.binance.com"
@@ -361,7 +364,7 @@ def score_trend(klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[d
             "tf_aligned": tf_aligned, "tf_dominant": tf_dominant}
 
 
-def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict) -> dict:
+def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict, symbol: str = "") -> dict:
     closes_15m = [k["close"] for k in klines_15m]
     closes_5m = [k["close"] for k in klines_5m]
     closes_1m = [k["close"] for k in klines_1m]
@@ -617,6 +620,34 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         reasons_long.append(f"空头拥挤 (资金费率{funding['funding_rate']:+.6f})")
         warnings.append("资金费率偏低，空头拥挤，小心轧空")
 
+    # ── Whale Score (巨鲸评分) ──────────────────────────────────────
+    # 文档: FinalScore = Technical×0.50 + FundRate×0.15 + OI×0.15 + Whale×0.20
+    # 集成方式: Whale Score 作为方向一致性因子，最大影响 ±12 分（相当于20%权重）
+    ws = 50.0
+    whale_result = {"grade_label": "中性 ➖", "confidence": 0.0}
+    try:
+        whale_result = calc_whale_score(symbol)
+        ws = whale_result["whale_score"]
+        wc = whale_result["confidence"]
+        whale_impact = (ws - 50) / 50 * 12  # -12 ~ +12
+        if wc < 0.4:
+            whale_impact *= 0.5
+        reason_tag = f"🐋 巨鲸WS={ws:.0f}"
+        if whale_impact > 3:
+            long_score += whale_impact
+            reasons_long.append(reason_tag)
+            if ws >= 70:
+                long_score += 4
+                reasons_long.append(f"🐋 巨鲸强烈看多")
+        elif whale_impact < -3:
+            short_score += abs(whale_impact)
+            reasons_short.append(reason_tag)
+            if ws <= 30:
+                short_score += 4
+                reasons_short.append(f"🐋 巨鲸强烈看空")
+    except Exception:
+        pass  # Whale Score 失败不中断主流程
+
     # ── 24h涨跌幅 ──
     if change_24h > 15:
         short_score += 10
@@ -755,6 +786,8 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "warnings": warnings[:4],
         "tf_aligned": trend_info["tf_aligned"],
         "change_24h": round(change_24h, 2),
+        "whale_score": round(ws, 1) if ws else 50.0,
+        "whale_grade_label": whale_result.get("grade_label", "中性 ➖") if ws else "中性 ➖",
     }
 
 
@@ -790,6 +823,11 @@ def format_gui_details(d: dict) -> str:
         sup_d = d.get('sup_dist_pct', 0)
         res_d = d.get('res_dist_pct', 0)
         parts.append(f"   S/R: 支撑 ${support:,.4f} (-{sup_d}%)  |  阻力 ${resistance:,.4f} (+{res_d}%)")
+
+    ws = d.get("whale_score", 50)
+    wl = d.get("whale_grade_label", "中性 ➖")
+    ws_emoji = "🔴" if ws < 40 else ("🟢" if ws > 60 else "⚪")
+    parts.append(f"   🐋 巨鲸评分: {ws:.0f}/100 {wl}")
 
     parts.append("")
 
@@ -827,6 +865,21 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
         direction = "NEUTRAL"
         confidence = max(long_prob, short_prob)
 
+    # ── Whale Score 方向一致性检查 ──
+    # 巨鲸方向和技术方向一致 → 加分；不一致 → 扣减仓位
+    ws = score_result.get("whale_score", 50.0)
+    ws_bullish = ws > 60
+    ws_bearish = ws < 40
+    whale_penalty = 1.0  # 1.0 = 不影响
+    if direction == "LONG" and ws_bearish:
+        whale_penalty = 0.5  # 技术看多但巨鲸看空 → 仓位减半
+    elif direction == "SHORT" and ws_bullish:
+        whale_penalty = 0.5
+    elif direction == "LONG" and ws_bullish:
+        whale_penalty = 1.2  # 双方向一致 → 增加信心
+    elif direction == "SHORT" and ws_bearish:
+        whale_penalty = 1.2
+
     base_sl_pct = max(atr_pct * 1.5, 0.5)
     score_confidence = max(long_prob, short_prob)
     if score_confidence >= 75:
@@ -851,6 +904,7 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
     position_pct = position_size / account_balance * 100 if account_balance > 0 else 0
     if score_confidence < 75:
         position_pct *= 0.6
+    position_pct *= whale_penalty  # Whale Score 方向一致性修正
 
     if atr_pct < 1:
         leverage = 5
@@ -862,6 +916,7 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
         leverage = 1
     if score_confidence < 65:
         leverage = max(int(leverage * 0.5), 1)
+    leverage = max(1, round(leverage * whale_penalty))  # Whale Score 杠杆修正
 
     notional_value = position_size
     if notional_value > account_balance * 2:
@@ -933,6 +988,13 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
             else:
                 r_str = "阻力 —"
         lines.append(f"     S/R: {s_str}  |  {r_str}")
+        lines.append("")
+        ws = score.get("whale_score", 50)
+        wl = score.get("whale_grade_label", "中性 ➖")
+        bars_ws = int(ws / 10)
+        ws_emoji = "🐋🔴" if ws < 40 else ("🐋🟢" if ws > 60 else "🐋⚪")
+        lines.append(f"  {ws_emoji} 巨鲸评分: {ws:.0f}/100  {wl}")
+        lines.append(f"     {'■' * bars_ws}{'░' * (10 - bars_ws)}  ")
 
     lines.append("")
     if score["reasons_long"]:
@@ -1013,7 +1075,7 @@ def analyze_coin(symbol: str, balance: float = 1000.0) -> str:
 
         funding = fetch_funding_rate(sym)
 
-        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding)
+        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym)
         risk = risk_recommendation(price, score, balance)
 
         return format_output(sym, score, risk, price, brief=False)
@@ -1045,7 +1107,7 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
 
         funding = fetch_funding_rate(sym)
 
-        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding)
+        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym)
         risk = risk_recommendation(price, score, balance)
 
         grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}
@@ -1095,6 +1157,8 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "resistance": score.get("resistance"),
             "sup_dist_pct": score.get("sup_dist_pct"),
             "res_dist_pct": score.get("res_dist_pct"),
+            "whale_score": score.get("whale_score", 50.0),
+            "whale_grade_label": score.get("whale_grade_label", "中性 ➖"),
         }
 
     except Exception as e:

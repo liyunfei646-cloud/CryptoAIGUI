@@ -57,7 +57,7 @@ def _st(s: str) -> str:
     """快捷 stylesheet 注入"""
     return s
 
-GRADE_NAMES = {"A": "GRADE S", "B": "GRADE A", "C": "GRADE B", "D": "GRADE C"}
+GRADE_NAMES = {"A": "🅰️ A", "B": "🅱️ B", "C": "©️ C", "D": "⚪ D"}
 
 # ═══════════════════════════════════════════════════════════════════════
 #  后台线程

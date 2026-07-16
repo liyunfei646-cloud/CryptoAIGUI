@@ -961,8 +961,8 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
     lines = []
     now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    grade_emoji = {"A": "🅰️ 强信号", "B": "🅱️ 中等", "C": "©️ 弱信号", "D": "⚪ 无信号"}
-    grade_tag = grade_emoji.get(score["grade"], f"等级 {score['grade']}")
+    grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}
+    grade_tag = f"{grade_emoji.get(score['grade'], '⚪')} {score['grade']}"
 
     lines.append(f"{'='*56}")
     lines.append(f"  🦐 币安信号雷达  |  {symbol.upper()}  |  {now_str}")
@@ -1053,7 +1053,7 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
     dir_emoji = {"LONG": "🟢 做多", "SHORT": "🔴 做空", "NEUTRAL": "⚪ 观望"}
 
     if risk["direction"] == "NEUTRAL" or risk["confidence"] < 60:
-        lines.append(f"  📋 操作建议  [等级 {score['grade']}]")
+        lines.append(f"  📋 操作建议  [{grade_tag}]")
         lines.append(f"  {'='*52}")
         lines.append(f"     建议: ⚪ 观望（信号不明确，信噪比过低）")
         lines.append(f"     置信度: {risk['confidence']}%")
@@ -1066,7 +1066,7 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
     else:
         sl_sign = f"-{risk['sl_pct']:.2f}%"
         tp_sign = f"+{risk['tp_pct']:.2f}%"
-        lines.append(f"  📋 操作建议  [等级 {score['grade']}]")
+        lines.append(f"  📋 操作建议  [{grade_tag}]")
         lines.append(f"  {'='*52}")
         lines.append(f"     方向: {dir_emoji.get(risk['direction'], risk['direction'])}")
         lines.append(f"     置信度: {risk['confidence']}%")
@@ -1147,7 +1147,7 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
         score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym)
         risk = risk_recommendation(price, score, balance)
 
-        grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}
+        grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}  # emoji only, label in GUI's GRADE_NAMES
         dir_labels = {"LONG": "🟢 看多", "SHORT": "🔴 看空", "NEUTRAL": "⚪ 观望"}
 
         return {

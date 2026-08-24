@@ -18,7 +18,9 @@ signal_audit.py — 信号审计系统 (V2.0 Phase 1)
 
 import json
 import os
+import sys
 import time
+from datetime import datetime
 
 SIGNALS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals")
 PENDING_FILE = os.path.join(SIGNALS_DIR, "signals_pending.jsonl")
@@ -243,7 +245,16 @@ def stats() -> dict:
 
 
 if __name__ == "__main__":
-    print("signals 目录:", SIGNALS_DIR)
-    print("pending:", len(_load_lines(PENDING_FILE)))
-    print("done:", len(_load_lines(DONE_FILE)))
-    print("统计:", stats())
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "stats"
+    if cmd == "evaluate":
+        # 定时任务入口：评估所有已到期窗口（幂等，可每小时跑）
+        try:
+            n = evaluate_pending()
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] evaluate: 归档 {n} 条, pending 剩余 {len(_load_lines(PENDING_FILE))}")
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] evaluate 异常: {e}")
+    elif cmd == "stats":
+        print("signals 目录:", SIGNALS_DIR)
+        print("pending:", len(_load_lines(PENDING_FILE)))
+        print("done:", len(_load_lines(DONE_FILE)))
+        print("统计:", stats())

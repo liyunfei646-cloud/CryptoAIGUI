@@ -15,6 +15,8 @@ from datetime import datetime, timezone, timedelta
 
 # ─── Whale Score 引擎 ────────────────────────────────────────────────
 from whale_score_engine import calc_whale_score, WEIGHTS
+# ─── V2.0 衍生品数据层 + Market Regime ──────────────────────────────
+from futures_data import build_derivatives_context, detect_market_regime
 
 # ─── 配置 ────────────────────────────────────────────────────────────────
 BINANCE_SPOT = "https://api.binance.com"
@@ -46,7 +48,11 @@ def _http_get(url: str, timeout: int = 15) -> bytes:
     raise last_err
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
+def fetch_klines(symbol: str, interval: str, limit: int = 200, closed_only: bool = False) -> list[dict]:
+    """
+    closed_only=True 时剔除尚未收盘的K线（V2.0 要求：核心信号只用已收盘数据）。
+    币安 klines 字段: k[0]=open_time, k[6]=close_time(ms)
+    """
     sym = symbol.upper()
     fapi_url = f"{BINANCE_FUTURES}/fapi/v1/klines?symbol={sym}&interval={interval}&limit={limit}"
     spot_url = f"{BINANCE_SPOT}/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}"
@@ -59,12 +65,17 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
             continue
     if raw is None:
         raise ConnectionError(f"无法获取 {sym} K线数据")
+    now_ms = int(time.time() * 1000)
     klines = []
     for k in raw:
-        klines.append({
+        item = {
             "time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
             "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
-        })
+            "close_time": int(k[6]),
+        }
+        if closed_only and item["close_time"] > now_ms:
+            continue
+        klines.append(item)
     return klines
 
 
@@ -364,10 +375,18 @@ def score_trend(klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[d
             "tf_aligned": tf_aligned, "tf_dominant": tf_dominant}
 
 
-def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict, symbol: str = "") -> dict:
+def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict, symbol: str = "", derivatives: dict = None, regime: dict = None, btc_regime: dict = None) -> dict:
     closes_15m = [k["close"] for k in klines_15m]
     closes_5m = [k["close"] for k in klines_5m]
     closes_1m = [k["close"] for k in klines_1m]
+
+    # V2.0: Market Regime / 衍生品上下文（缺省时保守回退）
+    if regime is None:
+        regime = {"regime": "RANGE", "trend_4h": "FLAT", "trend_1h": "FLAT",
+                  "high_volatility": False, "reasons": []}
+    if derivatives is None:
+        derivatives = {}
+    regime_name = regime.get("regime", "RANGE")
 
     long_score = 0
     short_score = 0
@@ -407,21 +426,30 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     # ── 24h涨跌幅 ──
     change_24h = float(ticker.get("priceChangePercent", 0))
 
-    # ── RSI ──
+    # ── RSI（V2.0: 超买超卖必须结合 Market Regime 解释，不再单独作为反转信号）──
+    rsi_reversal_ok = regime_name in ("RANGE", "CHAOS")
     if rsi_15m < 30:
-        long_score += 10
-        reasons_long.append(f"RSI超卖 ({rsi_15m:.1f})")
-        warnings.append(f"RSI超卖区 ({rsi_15m:.1f})，短期反弹概率大但趋势仍可能向下")
+        if rsi_reversal_ok or regime_name == "TREND_UP":
+            long_score += 10
+            reasons_long.append(f"RSI超卖+环境允许 ({rsi_15m:.1f})")
+            warnings.append(f"RSI超卖区 ({rsi_15m:.1f})，环境{regime_name}，反弹需结构确认")
+        else:
+            warnings.append(f"RSI超卖 ({rsi_15m:.1f}) 但处于{regime_name}，可能只是下跌加速，不做多")
     elif rsi_15m > 70:
-        short_score += 10
-        reasons_short.append(f"RSI超买 ({rsi_15m:.1f})")
-        warnings.append(f"RSI超买区 ({rsi_15m:.1f})，短期回调风险增加")
+        if rsi_reversal_ok or regime_name == "TREND_DOWN":
+            short_score += 10
+            reasons_short.append(f"RSI超买+环境允许 ({rsi_15m:.1f})")
+            warnings.append(f"RSI超买区 ({rsi_15m:.1f})，环境{regime_name}，回调需结构确认")
+        else:
+            warnings.append(f"RSI超买 ({rsi_15m:.1f}) 但处于{regime_name}，可能只是上涨加速，不做空")
     elif rsi_15m < 40:
-        long_score += 6
-        reasons_long.append(f"RSI偏低 ({rsi_15m:.1f})")
+        if regime_name in ("RANGE", "TREND_UP", "CHAOS"):
+            long_score += 6
+            reasons_long.append(f"RSI偏低 ({rsi_15m:.1f})")
     elif rsi_15m > 60:
-        short_score += 6
-        reasons_short.append(f"RSI偏高 ({rsi_15m:.1f})")
+        if regime_name in ("RANGE", "TREND_DOWN", "CHAOS"):
+            short_score += 6
+            reasons_short.append(f"RSI偏高 ({rsi_15m:.1f})")
 
     # ── EMA排列 ──
     if ema_bull:
@@ -648,21 +676,82 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     except Exception:
         pass  # Whale Score 失败不中断主流程
 
-    # ── 24h涨跌幅 ──
+    # ── 衍生品因子 (V2.0: OI / Taker / Funding 趋势) ────────────────
+    if derivatives:
+        price_up_15m = trend_info["trend_15m"] == "bull"
+        oi_trend = derivatives.get("oi_trend")
+        if oi_trend == "rising":
+            if price_up_15m:
+                long_score += 8
+                reasons_long.append(f"OI上升+价格上涨 (新多进场, 15m OI {derivatives.get('oi_change_15m', 0):+.1f}%)")
+            else:
+                short_score += 8
+                reasons_short.append(f"OI上升+价格下跌 (新空进场, 15m OI {derivatives.get('oi_change_15m', 0):+.1f}%)")
+        elif oi_trend == "falling":
+            if price_up_15m:
+                short_score += 4
+                reasons_short.append("OI下降+价格上涨 (空头平仓推动, 持续性存疑)")
+                warnings.append("OI下降+价格上涨，注意可能只是空头回补")
+            else:
+                short_score += 6
+                reasons_short.append("OI下降+价格下跌 (多头离场/踩踏)")
+
+        taker_trend = derivatives.get("taker_trend")
+        if taker_trend == "buy_dominant":
+            long_score += 6
+            reasons_long.append("Taker主动买盘主导")
+        elif taker_trend == "sell_dominant":
+            short_score += 6
+            reasons_short.append("Taker主动卖盘主导")
+
+        funding_regime = derivatives.get("funding_regime")
+        funding_rate_now = derivatives.get("funding_rate")
+        fr_str = f"{funding_rate_now:+.5f}" if funding_rate_now is not None else "?"
+        if funding_regime == "extreme_long":
+            short_score += 8
+            reasons_short.append(f"极端多头拥挤 (funding {fr_str})")
+            warnings.append("资金费率极端偏高，多头杠杆过热")
+        elif funding_regime == "long_crowded":
+            short_score += 5
+            reasons_short.append(f"多头拥挤 (funding {fr_str})")
+        elif funding_regime == "extreme_short":
+            long_score += 8
+            reasons_long.append(f"极端空头拥挤 (funding {fr_str})")
+            warnings.append("资金费率极端偏低，空头杠杆过热")
+        elif funding_regime == "short_crowded":
+            long_score += 5
+            reasons_long.append(f"空头拥挤 (funding {fr_str})")
+
+        if derivatives.get("funding_trend") == "rising" and (funding_rate_now or 0) > 0:
+            short_score += 3
+            reasons_short.append("Funding持续上升 (多头杠杆加速)")
+        elif derivatives.get("funding_trend") == "falling" and (funding_rate_now or 0) < 0:
+            long_score += 3
+            reasons_long.append("Funding持续下降 (空头杠杆加速)")
+
+    # ── 24h涨跌幅（V2.0: 大跌≠做多/大涨≠做空，必须结合 Market Regime）──
     if change_24h > 15:
-        short_score += 10
-        reasons_short.append(f"24h涨幅过大 ({change_24h:+.1f}%)")
-        warnings.append("24h涨幅超过15%，追高风险极大")
+        if regime_name in ("RANGE", "TREND_UP"):
+            short_score += 10
+            reasons_short.append(f"24h涨幅过大+环境允许 ({change_24h:+.1f}%)")
+            warnings.append("24h涨幅超过15%，追高风险极大")
+        else:
+            warnings.append(f"24h涨幅过大 ({change_24h:+.1f}%) 但处于{regime_name}，等待反转结构确认")
     elif change_24h < -15:
-        long_score += 10
-        reasons_long.append(f"24h跌幅过大 ({change_24h:+.1f}%)")
-        warnings.append("24h跌幅超过15%，抄底需谨慎")
+        if regime_name == "RANGE":
+            long_score += 10
+            reasons_long.append(f"24h跌幅过大+震荡环境 ({change_24h:+.1f}%)")
+            warnings.append("24h跌幅超过15%，仅震荡环境可博反弹")
+        else:
+            warnings.append(f"24h跌幅过大 ({change_24h:+.1f}%) 但处于{regime_name}，不接飞刀")
     elif 5 <= change_24h <= 15:
-        short_score += 5
-        reasons_short.append(f"24h涨幅适中 ({change_24h:+.1f}%)")
+        if regime_name in ("RANGE", "TREND_UP", "CHAOS"):
+            short_score += 5
+            reasons_short.append(f"24h涨幅适中 ({change_24h:+.1f}%)")
     elif -15 <= change_24h <= -5:
-        long_score += 5
-        reasons_long.append(f"24h跌幅适中 ({change_24h:+.1f}%)")
+        if regime_name == "RANGE":
+            long_score += 5
+            reasons_long.append(f"24h跌幅适中 ({change_24h:+.1f}%)")
 
     # ── MACD ──
     if macd_data["hist_trend"] == "rising":
@@ -734,6 +823,31 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         long_score -= VOLATILITY_DECAY // 2
         short_score -= VOLATILITY_DECAY // 2
 
+    # ── V2.0 硬过滤层 (Market Regime + BTC 大盘环境) ──
+    no_trade = False
+    no_trade_reason = ""
+    btc_regime_name = (btc_regime or {}).get("regime", "RANGE")
+    if long_score >= short_score:
+        if regime_name in ("TREND_DOWN", "BREAKDOWN"):
+            no_trade = True
+            no_trade_reason = f"标的处于 {regime_name}，禁止逆势做多"
+        elif btc_regime_name in ("TREND_DOWN", "BREAKDOWN"):
+            no_trade = True
+            no_trade_reason = f"BTC 大盘处于 {btc_regime_name}，禁止做多"
+        elif regime.get("trend_4h") == "DOWN" and regime.get("trend_1h") == "DOWN":
+            no_trade = True
+            no_trade_reason = "4H/1H 双空头趋势，禁止做多"
+    else:
+        if regime_name in ("TREND_UP", "BREAKOUT"):
+            no_trade = True
+            no_trade_reason = f"标的处于 {regime_name}，禁止逆势做空"
+        elif btc_regime_name in ("TREND_UP", "BREAKOUT"):
+            no_trade = True
+            no_trade_reason = f"BTC 大盘处于 {btc_regime_name}，禁止做空"
+        elif regime.get("trend_4h") == "UP" and regime.get("trend_1h") == "UP":
+            no_trade = True
+            no_trade_reason = "4H/1H 双多头趋势，禁止做空"
+
     # ── 计算概率 ──
     max_possible = 100
     net_score = long_score - short_score
@@ -752,6 +866,8 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         grade = "C"
     else:
         grade = "D"
+    if no_trade:
+        grade = "N"
 
     # 空判断用于显示
     long_str = "LONG" if long_prob >= 50 else "SHORT"
@@ -760,8 +876,8 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     return {
         "long_probability": long_prob,
         "short_probability": short_prob,
-        "long_score": long_score,
-        "short_score": short_score,
+        "long_score": round(long_score),
+        "short_score": round(short_score),
         "grade": grade,
         "direction_hint": long_str,
         "rsi": round(rsi_15m, 1),
@@ -792,6 +908,26 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
             fname: {"score": f["score"], "detail": f["detail"][:40]}
             for fname, f in whale_result.get("factors", {}).items()
         } if ws else {},
+        # ── V2.0 新增 ──
+        "market_regime": regime_name,
+        "trend_4h": regime.get("trend_4h", "FLAT"),
+        "trend_1h": regime.get("trend_1h", "FLAT"),
+        "regime_reasons": regime.get("reasons", []),
+        "btc_regime": btc_regime_name,
+        "no_trade": no_trade,
+        "no_trade_reason": no_trade_reason,
+        "oi": derivatives.get("oi"),
+        "oi_change_5m": derivatives.get("oi_change_5m"),
+        "oi_change_15m": derivatives.get("oi_change_15m"),
+        "oi_change_1h": derivatives.get("oi_change_1h"),
+        "oi_trend": derivatives.get("oi_trend"),
+        "funding_trend": derivatives.get("funding_trend"),
+        "funding_regime": derivatives.get("funding_regime"),
+        "taker_ratio": derivatives.get("taker_ratio"),
+        "taker_trend": derivatives.get("taker_trend"),
+        "global_ls_ratio": derivatives.get("global_ls_ratio"),
+        "liq_5m_long": derivatives.get("liq_5m_long"),
+        "liq_5m_short": derivatives.get("liq_5m_short"),
     }
 
 
@@ -801,6 +937,20 @@ def format_gui_details(d: dict) -> str:
     接收 analyze_coin_dict 返回的 dict。
     """
     parts = []
+
+    # ── V2.0 市场环境 ──
+    regime = d.get("market_regime", "—")
+    trend_4h = d.get("trend_4h", "—")
+    trend_1h = d.get("trend_1h", "—")
+    btc_regime = d.get("btc_regime", "—")
+    parts.append(f"🌍 市场环境: {regime}  (4H:{trend_4h} / 1H:{trend_1h} | BTC:{btc_regime})")
+    oi_chg = d.get("oi_change_15m")
+    if oi_chg is not None:
+        parts.append(f"   OI 15m: {oi_chg:+.1f}% ({d.get('oi_trend','—')})  |  Taker: {d.get('taker_trend','—')}  |  Funding: {d.get('funding_regime','—')} 趋势{d.get('funding_trend','—')}")
+    nt = d.get("no_trade_reason")
+    if nt:
+        parts.append(f"🚫 {nt}")
+    parts.append("")
 
     ema20 = d.get("ema20", 0)
     ema50 = d.get("ema50", 0)
@@ -961,12 +1111,15 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
     lines = []
     now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}
+    grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪", "N": "🚫"}
     grade_tag = f"{grade_emoji.get(score['grade'], '⚪')} {score['grade']}"
 
     lines.append(f"{'='*56}")
     lines.append(f"  🦐 币安信号雷达  |  {symbol.upper()}  |  {now_str}")
     lines.append(f"  信号等级: {grade_tag}")
+    lines.append(f"  🌍 环境: {score.get('market_regime','RANGE')} (4H:{score.get('trend_4h','—')}/1H:{score.get('trend_1h','—')} | BTC:{score.get('btc_regime','—')})")
+    if score.get("no_trade"):
+        lines.append(f"  🚫 {score.get('no_trade_reason','')}")
     lines.append(f"{'='*56}")
 
     if not brief:
@@ -1055,7 +1208,10 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
     if risk["direction"] == "NEUTRAL" or risk["confidence"] < 60:
         lines.append(f"  📋 操作建议  [{grade_tag}]")
         lines.append(f"  {'='*52}")
-        lines.append(f"     建议: ⚪ 观望（信号不明确，信噪比过低）")
+        if score.get("no_trade"):
+            lines.append(f"     建议: 🚫 NO TRADE（{score.get('no_trade_reason','')}）")
+        else:
+            lines.append(f"     建议: ⚪ 观望（信号不明确，信噪比过低）")
         lines.append(f"     置信度: {risk['confidence']}%")
         lines.append("")
         lines.append(f"     💡 等待以下条件改善后再入场：")
@@ -1108,12 +1264,28 @@ def analyze_coin(symbol: str, balance: float = 1000.0) -> str:
 
         klines_15m = fetch_klines(sym, "15m", 200)
         klines_5m = fetch_klines(sym, "5m", 100)
-        klines_1m = fetch_klines(sym, "1m", 60)
+        klines_1m = fetch_klines(sym, "1m", 60, closed_only=True)
+        klines_4h = fetch_klines(sym, "4h", 200, closed_only=True)
+        klines_1h = fetch_klines(sym, "1h", 200, closed_only=True)
 
         funding = fetch_funding_rate(sym)
 
-        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym)
+        # V2.0: 衍生品上下文 + Market Regime + BTC 大盘环境
+        derivatives = build_derivatives_context(sym)
+        regime = detect_market_regime(klines_4h, klines_1h)
+        btc_regime = None
+        try:
+            btc_4h = fetch_klines("BTCUSDT", "4h", 200, closed_only=True)
+            btc_1h = fetch_klines("BTCUSDT", "1h", 200, closed_only=True)
+            btc_regime = detect_market_regime(btc_4h, btc_1h)
+        except Exception:
+            btc_regime = None
+
+        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym,
+                             derivatives=derivatives, regime=regime, btc_regime=btc_regime)
         risk = risk_recommendation(price, score, balance)
+        if score.get("no_trade"):
+            risk["direction"] = "NEUTRAL"
 
         return format_output(sym, score, risk, price, brief=False)
 
@@ -1140,14 +1312,30 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
 
         klines_15m = fetch_klines(sym, "15m", 200)
         klines_5m = fetch_klines(sym, "5m", 100)
-        klines_1m = fetch_klines(sym, "1m", 60)
+        klines_1m = fetch_klines(sym, "1m", 60, closed_only=True)
+        klines_4h = fetch_klines(sym, "4h", 200, closed_only=True)
+        klines_1h = fetch_klines(sym, "1h", 200, closed_only=True)
 
         funding = fetch_funding_rate(sym)
 
-        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym)
-        risk = risk_recommendation(price, score, balance)
+        # V2.0: 衍生品上下文 + Market Regime + BTC 大盘环境
+        derivatives = build_derivatives_context(sym)
+        regime = detect_market_regime(klines_4h, klines_1h)
+        btc_regime = None
+        try:
+            btc_4h = fetch_klines("BTCUSDT", "4h", 200, closed_only=True)
+            btc_1h = fetch_klines("BTCUSDT", "1h", 200, closed_only=True)
+            btc_regime = detect_market_regime(btc_4h, btc_1h)
+        except Exception:
+            btc_regime = None
 
-        grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪"}  # emoji only, label in GUI's GRADE_NAMES
+        score = score_system(price, klines_15m, klines_5m, klines_1m, ticker, funding, sym,
+                             derivatives=derivatives, regime=regime, btc_regime=btc_regime)
+        risk = risk_recommendation(price, score, balance)
+        if score.get("no_trade"):
+            risk["direction"] = "NEUTRAL"
+
+        grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪", "N": "🚫"}  # emoji only, label in GUI's GRADE_NAMES
         dir_labels = {"LONG": "🟢 看多", "SHORT": "🔴 看空", "NEUTRAL": "⚪ 观望"}
 
         return {
@@ -1197,6 +1385,26 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "whale_score": score.get("whale_score", 50.0),
             "whale_grade_label": score.get("whale_grade_label", "中性 ➖"),
             "whale_factors": score.get("whale_factors", {}),
+            # ── V2.0 新增 ──
+            "market_regime": score.get("market_regime", "RANGE"),
+            "trend_4h": score.get("trend_4h", "FLAT"),
+            "trend_1h": score.get("trend_1h", "FLAT"),
+            "regime_reasons": score.get("regime_reasons", []),
+            "btc_regime": score.get("btc_regime", "RANGE"),
+            "no_trade": score.get("no_trade", False),
+            "no_trade_reason": score.get("no_trade_reason", ""),
+            "oi": score.get("oi"),
+            "oi_change_5m": score.get("oi_change_5m"),
+            "oi_change_15m": score.get("oi_change_15m"),
+            "oi_change_1h": score.get("oi_change_1h"),
+            "oi_trend": score.get("oi_trend"),
+            "funding_trend": score.get("funding_trend"),
+            "funding_regime": score.get("funding_regime"),
+            "taker_ratio": score.get("taker_ratio"),
+            "taker_trend": score.get("taker_trend"),
+            "global_ls_ratio": score.get("global_ls_ratio"),
+            "liq_5m_long": score.get("liq_5m_long"),
+            "liq_5m_short": score.get("liq_5m_short"),
         }
 
     except Exception as e:

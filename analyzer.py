@@ -894,6 +894,18 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
 
     signal_status = "NO_TRADE" if no_trade else entry_trigger
 
+    # 最近结构低点/高点（V2.0 结构止损依据，取 entry 同侧最近的摆动点）
+    swing_low_recent = None
+    swing_high_recent = None
+    for sl_ in reversed(swing.get("swing_lows", [])):
+        if sl_[1] < price:
+            swing_low_recent = sl_[1]
+            break
+    for sh_ in reversed(swing.get("swing_highs", [])):
+        if sh_[1] > price:
+            swing_high_recent = sh_[1]
+            break
+
     # ── 计算概率 ──
     max_possible = 100
     net_score = long_score - short_score
@@ -966,6 +978,9 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "signal_status": signal_status,
         "trigger_met": trigger_met,
         "trigger_missing": trigger_missing,
+        "swing_low_recent": swing_low_recent,
+        "swing_high_recent": swing_high_recent,
+        "atr_val": round(atr_val, 6),
         "oi": derivatives.get("oi"),
         "oi_change_5m": derivatives.get("oi_change_5m"),
         "oi_change_15m": derivatives.get("oi_change_15m"),
@@ -1113,24 +1128,70 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
     elif direction == "SHORT" and ws_bearish:
         whale_penalty = 1.2
 
-    base_sl_pct = max(atr_pct * 1.5, 0.5)
+    # ── V2.0 结构止损 + 动态 TP（文档17节）──
+    # SL = 结构位(留缓冲) 与 ATR 保护的组合：至少 ATR×1，至多 ATR×3
+    # TP1 = 最近结构阻力/支撑，TP2 = 24h 极值（下一流动性目标）
+    # 不再固定 TP = SL × 2
     score_confidence = max(long_prob, short_prob)
     if score_confidence >= 75:
-        sl_multiplier = 1.2
+        conf_mult = 0.9
     elif score_confidence >= 65:
-        sl_multiplier = 1.5
+        conf_mult = 1.0
     else:
-        sl_multiplier = 2.0
-    sl_pct = base_sl_pct * sl_multiplier
+        conf_mult = 1.1
+    atr_val = score_result.get("atr_val") or price * atr_pct / 100
 
+    sl_basis = "ATR"
     if direction == "LONG":
+        swing_ref = score_result.get("swing_low_recent")
+        if swing_ref and swing_ref < price:
+            struct_dist = (price - swing_ref * 0.999) / price * 100
+            sl_pct = max(struct_dist, atr_pct * 1.0)
+            sl_basis = "结构低点"
+        else:
+            sl_pct = atr_pct * 1.5
+        sl_pct = min(sl_pct, atr_pct * 3.0)
+        sl_pct = max(sl_pct, 0.5) * conf_mult
         stop_loss = price * (1 - sl_pct / 100)
-        take_profit = price * (1 + sl_pct * 2 / 100)
+        # 动态 TP：TP1 = 最近阻力；TP2 = 24h 高（下一流动性目标）
+        tp1_price = score_result.get("resistance")
+        if tp1_price and tp1_price > price:
+            tp1_pct = (tp1_price - price) / price * 100
+        else:
+            tp1_pct = sl_pct * 2
+        tp2_price = score_result.get("high_24h")
+        if tp2_price and tp2_price > price * (1 + tp1_pct / 100) * 1.001:
+            tp2_pct = (tp2_price - price) / price * 100
+        else:
+            tp2_pct = tp1_pct * 1.5
+        take_profit = price * (1 + tp1_pct / 100)
+        tp2_price_out = price * (1 + tp2_pct / 100)
     else:
+        swing_ref = score_result.get("swing_high_recent")
+        if swing_ref and swing_ref > price:
+            struct_dist = (swing_ref * 1.001 - price) / price * 100
+            sl_pct = max(struct_dist, atr_pct * 1.0)
+            sl_basis = "结构高点"
+        else:
+            sl_pct = atr_pct * 1.5
+        sl_pct = min(sl_pct, atr_pct * 3.0)
+        sl_pct = max(sl_pct, 0.5) * conf_mult
         stop_loss = price * (1 + sl_pct / 100)
-        take_profit = price * (1 - sl_pct * 2 / 100)
+        # 动态 TP：TP1 = 最近支撑；TP2 = 24h 低（下一流动性目标）
+        tp1_price = score_result.get("support")
+        if tp1_price and 0 < tp1_price < price:
+            tp1_pct = (price - tp1_price) / price * 100
+        else:
+            tp1_pct = sl_pct * 2
+        tp2_price = score_result.get("low_24h")
+        if tp2_price and 0 < tp2_price < price * (1 - tp1_pct / 100) * 0.999:
+            tp2_pct = (price - tp2_price) / price * 100
+        else:
+            tp2_pct = tp1_pct * 1.5
+        take_profit = price * (1 - tp1_pct / 100)
+        tp2_price_out = price * (1 - tp2_pct / 100)
 
-    rr_ratio = round(2.0 / 1, 1)
+    rr_ratio = round(tp1_pct / sl_pct, 1) if sl_pct > 0 else 0
 
     risk_amount = account_balance * 0.02
     position_size = risk_amount / (sl_pct / 100) if sl_pct > 0 else 0
@@ -1163,8 +1224,10 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
         "stop_loss": round(stop_loss, 6) if price < 1000 else round(stop_loss, 2),
         "take_profit": round(take_profit, 6) if price < 1000 else round(take_profit, 2),
         "sl_pct": round(sl_pct, 2),
-        "tp_pct": round(sl_pct * 2, 2),
+        "tp_pct": round(tp1_pct, 2),
         "rr_ratio": rr_ratio,
+        "tp2_price": round(tp2_price_out, 6) if price < 1000 else round(tp2_price_out, 2),
+        "sl_basis": sl_basis,
         "leverage": leverage,
         "position_pct": round(position_pct, 1),
         "notional_value": round(notional_value, 2),
@@ -1297,8 +1360,9 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
         lines.append(f"     方向: {dir_emoji.get(risk['direction'], risk['direction'])}")
         lines.append(f"     置信度: {risk['confidence']}%")
         lines.append(f"     入场价: ${risk['entry_price']:,.6f}")
-        lines.append(f"     止损价: ${risk['stop_loss']:,.6f}  ({sl_sign})")
+        lines.append(f"     止损价: ${risk['stop_loss']:,.6f}  ({sl_sign})  依据: {risk.get('sl_basis','ATR')}")
         lines.append(f"     止盈价: ${risk['take_profit']:,.6f}  ({tp_sign})")
+        lines.append(f"     TP2: ${risk.get('tp2_price',0):,.6f}  (下一流动性目标)")
         lines.append(f"     盈亏比: 1:{risk['rr_ratio']}")
         lines.append(f"     建议杠杆: {risk['leverage']}x  (保证金{risk['position_pct']}%)")
         lines.append(f"     名义仓位: ${risk['notional_value']:,.2f}")
@@ -1454,6 +1518,8 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "sl_pct": risk["sl_pct"],
             "tp_pct": risk["tp_pct"],
             "rr_ratio": risk["rr_ratio"],
+            "tp2_price": risk.get("tp2_price"),
+            "sl_basis": risk.get("sl_basis", "ATR"),
             "leverage": risk["leverage"],
             "position_pct": risk["position_pct"],
             "notional_value": risk["notional_value"],

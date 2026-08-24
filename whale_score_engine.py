@@ -1,26 +1,30 @@
 """
-whale_score_engine.py — 巨鲸评分引擎 (Whale Score V1.0)
-======================================================
-根据 WhaleScore_V1.md 设计文档实现。
+whale_score_engine.py — 巨鲸评分引擎 (Whale Score V2.0)
+=======================================================
+基于 WhaleScore_V1.md 设计文档 + 《V2.0优化方案》第5/6/7节重构。
+
+V2.0 核心变更（数据源去重）：
+  1. 订单簿只保留一个独立因子 orderbook_score (权重10%)
+     —— 旧版 Exchange/Concentration/SmartMoney 三个因子都读订单簿，同一数据源重复计分
+  2. Exchange 改用 Taker Buy/Sell（真实主动买卖资金流）
+  3. Holding 改用 OI 变化 + Funding 趋势（OI 才是持仓量的直接度量）
+  4. Smart Money 改用 多空账户比 + 强平结构 + Funding + 价格位置
+  5. Concentration 降权至5%（CoinGecko Rank 不等于真实持仓集中度，仅作参考）
 
 架构：
   ScoreBoard.fetch(symbol) → dict
-    ├─ exchange_score     (权重 30%) — 交易所资金流
-    ├─ holding_score       (权重 25%) — 巨鲸持仓变化
-    ├─ transfer_score      (权重 15%) — 大额转账活跃度
-    ├─ concentration_score (权重 10%) — 持仓集中度
-    ├─ smart_money_score   (权重 20%) — 聪明钱行为
+    ├─ exchange_score     (权重 20%) — Taker 资金流
+    ├─ holding_score       (权重 20%) — OI 变化 + Funding 趋势
+    ├─ transfer_score      (权重 15%) — 大额转账活跃度（CoinGecko 代理）
+    ├─ concentration_score (权重  5%) — CoinGecko Rank（参考）
+    ├─ smart_money_score   (权重 30%) — 多空账户比 + 强平 + Funding
+    ├─ orderbook_score     (权重 10%) — 订单簿失衡（唯一订单簿因子）
     └─ whale_score         (0~100)    — 加权聚合分
 
 数据源优先级：
   1. 链上 API（Glassnode / Nansen / CoinGecko / CoinMetrics）
-  2. 交易所数据估算（币安订单簿/成交数据）
+  2. 交易所数据（币安 OI/Taker/Funding/强平/订单簿）
   3. 保守回退值（50 分 = 中性）
-
-超短线场景适配：
-  - 对于小币种（山寨币），多数链上数据不可用
-  - 使用交易所级代理指标估算巨鲸行为
-  - 评分结果作为 FinalScore 中的 20% 权重因子
 """
 
 import json
@@ -30,19 +34,23 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+# V2.0: 衍生品数据层（OI/Taker/Funding趋势/多空比/强平）
+import futures_data
+
 # ─── 全局配置 ────────────────────────────────────────────────────────────
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 BINANCE_API = "https://api.binance.com"
 BINANCE_FUTURES = "https://fapi.binance.com"
 TZ = timezone(timedelta(hours=8))
 
-# 评分因子权重（与文档一致）
+# 评分因子权重（V2.0 去重后重新分配）
 WEIGHTS = {
-    "exchange": 0.30,
-    "holding": 0.25,
+    "exchange": 0.20,
+    "holding": 0.20,
     "transfer": 0.15,
-    "concentration": 0.10,
-    "smart_money": 0.20,
+    "concentration": 0.05,
+    "smart_money": 0.30,
+    "orderbook": 0.10,
 }
 
 _DATA_CACHE: dict = {}
@@ -281,131 +289,137 @@ def _fetch_funding_rate(symbol: str) -> Optional[dict]:
 
 def _score_exchange(data: dict) -> dict:
     """
-    4.1 交易所资金流评分 (Exchange Score)
-    权重 30%
+    4.1 交易所资金流评分 (Exchange Score) — V2.0
+    权重 20%
 
-    使用订单簿买卖压力作为交易所资金流的代理指标。
-    真实交易所净流出需要 Glassnode/CoinMetrics 等链上数据源。
+    数据源: Taker Buy/Sell（真实主动买卖资金流）
+    V2.0 变更: 不再使用订单簿——订单簿已收敛为独立 orderbook 因子，
+    避免同一数据源重复计分（文档第7节）。
 
-    评分映射（订单簿买卖比 → 净流出等价分）：
-      买卖比 > 1.5  → 看多（买方强）→ 80~100
-      买卖比 1.0~1.5 → 偏多 → 60~80
-      买卖比 0.8~1.0 → 中性 → 40~60
-      买卖比 < 0.8  → 偏空 → 20~40
+    评分映射（Taker 买/卖比）：
+      > 1.5   → 买盘强 → 80~95
+      1.2~1.5 → 偏买   → 65~80
+      0.95~1.2 → 中性  → 45~62
+      < 0.8   → 偏卖   → 20~40
     """
-    ob = _fetch_binance_orderbook(data.get("symbol", ""))
-    
-    if ob is None:
-        return {"score": 50, "confidence": "low", "source": "default", "detail": "无法获取订单簿数据，默认中性"}
+    symbol = data.get("symbol", "")
+    try:
+        tk = futures_data.fetch_taker_series(symbol, "15m", 4)
+    except Exception:
+        tk = None
+    if not tk or len(tk) < 2:
+        return {"score": 50, "confidence": "low", "source": "default",
+                "detail": "无法获取Taker数据，默认中性"}
 
-    ratio = ob["ratio"]
-    imbalance = ob["imbalance_pct"]
+    ratio = tk[-1]["ratio"]
+    ratio_ago = tk[0]["ratio"]  # 45分钟前
 
-    # 根据买卖不平衡比例计算分数
-    if imbalance > 30:
-        score = 100
-        detail = f"买方大幅占优 (买卖比 {ratio:.2f})"
-    elif imbalance > 15:
-        score = 85
-        detail = f"买方明显占优 (买卖比 {ratio:.2f})"
-    elif imbalance > 5:
-        score = 70
-        detail = f"买方略占优 (买卖比 {ratio:.2f})"
-    elif imbalance > -5:
-        score = 55
-        detail = f"买卖均衡 (买卖比 {ratio:.2f})"
-    elif imbalance > -15:
-        score = 40
-        detail = f"卖方略占优 (买卖比 {ratio:.2f})"
-    elif imbalance > -30:
+    if ratio >= 1.5:
+        score = 90
+        detail = f"Taker主动买盘占优 (买/卖 {ratio:.2f})"
+    elif ratio >= 1.2:
+        score = 75
+        detail = f"Taker买盘偏强 (买/卖 {ratio:.2f})"
+    elif ratio >= 1.05:
+        score = 62
+        detail = f"Taker买盘略优 (买/卖 {ratio:.2f})"
+    elif ratio >= 0.95:
+        score = 50
+        detail = f"Taker买卖均衡 (买/卖 {ratio:.2f})"
+    elif ratio >= 0.8:
+        score = 38
+        detail = f"Taker卖盘略优 (买/卖 {ratio:.2f})"
+    elif ratio >= 0.65:
         score = 25
-        detail = f"卖方明显占优 (买卖比 {ratio:.2f})"
+        detail = f"Taker卖盘偏强 (买/卖 {ratio:.2f})"
     else:
-        score = 15
-        detail = f"卖方大幅占优 (买卖比 {ratio:.2f})"
+        score = 10
+        detail = f"Taker主动卖盘占优 (买/卖 {ratio:.2f})"
 
-    return {"score": score, "confidence": "medium", "source": "binance_orderbook",
+    # 趋势修正：当前 vs 45分钟前
+    if ratio > ratio_ago * 1.2:
+        score += 8
+        detail += " | 买盘在增强"
+    elif ratio < ratio_ago * 0.8:
+        score -= 8
+        detail += " | 卖压在增强"
+
+    score = max(5, min(95, score))
+    return {"score": score, "confidence": "medium", "source": "binance_taker",
             "detail": detail}
 
 
 def _score_holding(data: dict) -> dict:
     """
-    4.2 巨鲸持仓变化评分 (Holding Score)
-    权重 25%
+    4.2 巨鲸持仓变化评分 (Holding Score) — V2.0
+    权重 20%
 
-    使用资金费率的方向和资金动向作为持仓变化的代理指标。
-    真实巨鲸地址数变化需要 Glassnode 等链上数据。
+    数据源: OI 变化（真实合约持仓量）+ Funding 趋势
+    V2.0 变更: 用 OI 替代旧版"订单簿+单点Funding"代理——
+    OI 才是持仓量的直接度量（文档第3节）。
 
     代理逻辑：
-      - 资金费率极度负值（空头拥挤）+ 市场上涨 → 巨鲸可能在建多仓
-      - 资金费率极度正值（多头拥挤）+ 市场下跌 → 巨鲸可能在平多/建空
-      - 活跃成交数变化作为交易活跃度参考
+      - OI 15m 大幅增加 → 大资金建仓（方向结合价格）
+      - OI 15m 大幅减少 → 大资金离场
+      - Funding 绝对值大 → 杠杆拥挤风险
     """
     symbol = data.get("symbol", "")
     ticker = _fetch_ticker_24h(symbol)
-    funding = _fetch_funding_rate(symbol)
+    try:
+        oi_hist = futures_data.fetch_oi_series(symbol, "15m", 5)
+        frs = futures_data.fetch_funding_series(symbol, 6)
+    except Exception:
+        oi_hist = None
+        frs = None
 
     if ticker is None:
         return {"score": 50, "confidence": "low", "source": "default", "detail": "无行情数据，默认中性"}
 
-    price = ticker["price"]
     change_pct = ticker["change_pct"]
-    vol = ticker.get("volume", 0)
-    quote_vol = ticker.get("quote_volume", 0)
+    score = 55
+    detail_parts = []
 
-    score = 60  # 默认中性偏高（山寨币通常有一定集中度）
+    # OI 变化（15m）→ 大资金建仓/离场
+    if oi_hist and len(oi_hist) >= 2:
+        oi_now = oi_hist[-1]["oi_value"]
+        oi_prev = oi_hist[0]["oi_value"]
+        if oi_prev > 0:
+            oi_chg = (oi_now - oi_prev) / oi_prev * 100
+            if oi_chg > 2:
+                score += 12
+                detail_parts.append(f"OI 15m +{oi_chg:.1f}% 新仓进场")
+            elif oi_chg > 0.5:
+                score += 5
+                detail_parts.append(f"OI 15m +{oi_chg:.1f}% 缓慢增仓")
+            elif oi_chg < -2:
+                score -= 10
+                detail_parts.append(f"OI 15m {oi_chg:.1f}% 大资金离场")
+            elif oi_chg < -0.5:
+                score -= 4
+                detail_parts.append(f"OI 15m {oi_chg:.1f}% 减仓")
+            # OI 方向与价格结合
+            if oi_chg > 1 and change_pct > 2:
+                score += 8
+                detail_parts.append("增仓+上涨 (多头建仓)")
+            elif oi_chg > 1 and change_pct < -2:
+                score -= 8
+                detail_parts.append("增仓+下跌 (空头建仓)")
 
-    # 使用成交额变化作为持仓活跃度代理
-    # 高成交额 + 价格方向 = 可能的大资金行为
-    cg = _fetch_coin_gecko_data(symbol)
-    cg_vol = cg.get("total_volume", 0) or quote_vol
-    mc = cg.get("market_cap") or 0
-
-    if mc > 0 and cg_vol > 0:
-        vol_to_mc = cg_vol / mc
-        # 成交额/市值比高 → 换手率高 → 活跃
-        if vol_to_mc > 0.3:
-            score += 15  # 高活跃度，大资金可能在活动
-            detail = f"高换手率 ({vol_to_mc:.1%}), 巨鲸活跃"
-        elif vol_to_mc > 0.15:
-            score += 8
-            detail = f"中等换手率 ({vol_to_mc:.1%}), 正常"
-        elif vol_to_mc > 0.05:
-            score -= 5
-            detail = f"低换手率 ({vol_to_mc:.1%}), 大资金不活跃"
-        else:
-            score -= 15
-            detail = f"极度低换手率 ({vol_to_mc:.1%}), 流动性不足"
-    else:
-        # 没有市值数据，用成交额绝对值估算
-        if quote_vol > 100_000_000:
-            score += 10
-            detail = f"高成交额 (${quote_vol/1e6:.0f}M)"
-        elif quote_vol > 10_000_000:
-            score += 5
-            detail = f"中等成交额 (${quote_vol/1e6:.0f}M)"
-        elif quote_vol > 1_000_000:
-            score += 0
-            detail = f"偏低成交额 (${quote_vol/1e6:.0f}M)"
-        else:
-            score -= 15
-            detail = f"极低成交额 (${quote_vol/1e6:.0f}M), 流动性风险"
-
-    # 资金费率方向修正
-    if funding:
-        fr = funding["funding_rate"]
-        if funding["signal"] == "short_crowded" and change_pct > 0:
-            # 空头拥挤 + 价格上涨 → 轧空迹象 → 巨鲸可能在逼空
-            score += 10
-            detail += " | 空头拥挤+上涨，逼空可能"
-        elif funding["signal"] == "long_crowded" and change_pct < 0:
-            # 多头拥挤 + 价格下跌 → 多头踩踏 → 巨鲸可能在出货
-            score -= 10
-            detail += " | 多头拥挤+下跌，出货风险"
+    # Funding 趋势 → 杠杆拥挤度
+    if frs and len(frs) >= 3:
+        rates = [r["rate"] for r in frs]
+        fr_now = rates[-1]
+        if abs(fr_now) > 0.0005:
+            score -= 8
+            detail_parts.append(f"Funding {fr_now:+.5f} 杠杆过热")
+        elif abs(fr_now) > 0.0001:
+            score -= 3
+            detail_parts.append(f"Funding {fr_now:+.5f} 略拥挤")
 
     score = max(10, min(95, score))
-    conf = "medium" if cg.get("market_cap") else "low"
-    return {"score": score, "confidence": conf, "source": "proxy",
+    detail = " | ".join(detail_parts) if detail_parts else "持仓变化平淡"
+    conf = "medium" if oi_hist else "low"
+    return {"score": score, "confidence": conf, "source": "futures_oi+funding",
             "detail": detail}
 
 
@@ -485,154 +499,160 @@ def _score_transfer(data: dict) -> dict:
 
 def _score_concentration(data: dict) -> dict:
     """
-    4.4 持仓集中度评分 (Concentration Score)
-    权重 10%
-
-    使用市场深度和成交额分布作为集中度代理。
-    真实 Top10 持仓占比需要 CoinGecko 或链上 API。
+    4.4 持仓集中度评分 (Concentration Score) — V2.0
+    权重 5%（降权：文档第5节指出 CoinGecko Rank 不等于真实持仓集中度，
+    本因子仅作参考，不再使用订单簿）
 
     评分：集中度越低分越高（分散 = 健康 = 高评分）
     """
     symbol = data.get("symbol", "")
-    ob = _fetch_binance_orderbook(symbol)
-    ticker = _fetch_ticker_24h(symbol)
     cg = _fetch_coin_gecko_data(symbol)
-
-    if ob is None or ticker is None:
-        return {"score": 50, "confidence": "low", "source": "default", "detail": "数据不足，默认中性"}
-
-    score = 60
-
-    # 使用订单簿深度作为集中度代理
-    bid_vol = ob["bid_vol"]
-    ask_vol = ob["ask_vol"]
-    total_depth = bid_vol + ask_vol
-    imbalance = abs(ob["imbalance_pct"])
-
-    # 极端不平衡 → 集中度高（可能被操纵）
-    if imbalance > 50:
-        score -= 20
-        detail = f"订单簿极度不平衡 ({imbalance:.0f}%), 操纵风险高"
-    elif imbalance > 30:
-        score -= 10
-        detail = f"订单簿明显不平衡 ({imbalance:.0f}%), 集中度偏高"
-    elif imbalance > 15:
-        score -= 5
-        detail = f"订单簿轻度不平衡 ({imbalance:.0f}%)"
-    else:
-        score += 10
-        detail = f"订单簿均衡分散 ({imbalance:.0f}%)"
-
-    # 成交额分散度（CoinGecko rank 作为参考）
     cg_rank = cg.get("market_cap_rank")
-    if cg_rank:
-        if cg_rank <= 10:
-            score += 20
-            detail += f" | 主流币 (Rank #{cg_rank}), 分散度高"
-        elif cg_rank <= 50:
-            score += 10
-            detail += f" | 大盘币 (Rank #{cg_rank})"
-        elif cg_rank <= 200:
-            score += 0
-            detail += f" | 中盘币 (Rank #{cg_rank})"
-        elif cg_rank <= 500:
-            score -= 10
-            detail += f" | 小盘币 (Rank #{cg_rank}), 集中度风险"
-        else:
-            score -= 20
-            detail += f" | 微盘币 (Rank #{cg_rank}), 集中度高, 操纵风险大"
-    else:
-        # 没有排名 → 微盘币
-        score -= 15
-        detail += " | 未上CoinGecko排名, 高度集中风险"
 
-    score = max(10, min(95, score))
-    return {"score": score, "confidence": "medium",
-            "source": "orderbook+coingecko",
+    if not cg_rank:
+        return {"score": 40, "confidence": "low", "source": "coingecko",
+                "detail": "未上CoinGecko排名, 集中度风险"}
+
+    if cg_rank <= 10:
+        score = 85
+        detail = f"主流币 (Rank #{cg_rank}), 分散度高"
+    elif cg_rank <= 50:
+        score = 70
+        detail = f"大盘币 (Rank #{cg_rank})"
+    elif cg_rank <= 200:
+        score = 55
+        detail = f"中盘币 (Rank #{cg_rank})"
+    elif cg_rank <= 500:
+        score = 40
+        detail = f"小盘币 (Rank #{cg_rank}), 集中度风险"
+    else:
+        score = 25
+        detail = f"微盘币 (Rank #{cg_rank}), 操纵风险大"
+
+    return {"score": score, "confidence": "medium", "source": "coingecko",
             "detail": detail}
 
 
 def _score_smart_money(data: dict) -> dict:
     """
-    4.5 聪明钱评分 (Smart Money Score)
-    权重 20%
+    4.5 聪明钱评分 (Smart Money Score) — V2.0
+    权重 30%
 
-    使用订单簿买方/卖方深度 + 资金费率 + 价格行为综合判断。
-    真实聪明钱流入流出需要 Nansen / 0xScope / Arkham 等链上标签数据。
+    数据源: 全账户多空比 + 最近强平方向 + Funding + 价格位置
+    V2.0 变更: 不再使用订单簿（文档第7节去重）。
 
-    代理逻辑：
-      - 深度买/卖比 + 资金费率方向 → 聪明钱偏向
-      - 价格在关键支撑阻力附近的行为 → 聪明钱正在交易
+    代理逻辑（反向指标为主）：
+      - 散户多空账户比极端 → 聪明钱反向
+      - 多头/空头爆仓集中释放 → 流动性耗尽，反转信号
+      - Funding 极端拥挤 → 反向
     """
     symbol = data.get("symbol", "")
-    ob = _fetch_binance_orderbook(symbol)
-    funding = _fetch_funding_rate(symbol)
     ticker = _fetch_ticker_24h(symbol)
+    try:
+        ls = futures_data.fetch_global_ls_ratio(symbol, "1h")
+        liq = futures_data.fetch_recent_liquidations(symbol)
+        frs = futures_data.fetch_funding_series(symbol, 4)
+    except Exception:
+        ls = None
+        liq = None
+        frs = None
 
-    if ob is None or ticker is None:
+    if ticker is None:
         return {"score": 50, "confidence": "low", "source": "default", "detail": "数据不足，默认中性"}
 
     price = ticker["price"]
     change_pct = ticker["change_pct"]
     high_24h = ticker["high"]
     low_24h = ticker["low"]
-
     score = 50
     signals = []
 
-    # 判断：聪明钱通常在关键位置反向操作
     range_24h = high_24h - low_24h
-    if range_24h > 0:
-        range_pos = (price - low_24h) / range_24h
-    else:
-        range_pos = 0.5
+    range_pos = (price - low_24h) / range_24h if range_24h > 0 else 0.5
 
-    # 价格在高位但资金费率显示空头拥挤 → 聪明钱可能在做空
-    if range_pos > 0.75 and funding and funding["signal"] == "short_crowded":
-        score += 15
-        signals.append("高价区+空头拥挤, 聪明钱可能做空")
-    # 价格在低位但资金费率显示多头拥挤 → 聪明钱可能在做多
-    elif range_pos < 0.25 and funding and funding["signal"] == "long_crowded":
-        score += 15
-        signals.append("低价区+多头拥挤, 聪明钱可能做多")
-    # 价格在低位 + 空头拥挤 → 散户做空, 聪明钱吸筹
-    elif range_pos < 0.25 and funding and funding["signal"] == "short_crowded":
-        score += 20
-        signals.append("低价区+空头拥挤, 聪明钱可能吸筹")
+    # 1) 散户多空账户比（反向指标）
+    if ls is not None:
+        if ls > 2.5:
+            score -= 12
+            signals.append(f"散户多头拥挤 (LS {ls:.2f}), 聪明钱可能反向做空")
+        elif ls < 0.4:
+            score += 12
+            signals.append(f"散户空头拥挤 (LS {ls:.2f}), 聪明钱可能反向做多")
 
-    # 订单簿深度信号
-    bid_not = ob["bid_notional"]
-    ask_not = ob["ask_notional"]
-    depth_ratio = bid_not / ask_not if ask_not > 0 else 1
+    # 2) 强平结构（流动性释放）
+    if liq and liq.get("count", 0) > 0:
+        liq_long = liq.get("long") or 0
+        liq_short = liq.get("short") or 0
+        if liq_long > 0 and liq_long > liq_short * 2 and change_pct < -1:
+            score += 10
+            signals.append("多头爆仓集中释放, 抛压衰竭")
+        elif liq_short > 0 and liq_short > liq_long * 2 and change_pct > 1:
+            score += 10
+            signals.append("空头爆仓集中释放, 逼空动能强")
 
-    if depth_ratio > 1.8:
-        score += 15
-        signals.append("买方深度远超卖方, 聪明钱在买入")
-    elif depth_ratio > 1.3:
-        score += 8
-        signals.append("买方深度较优")
-    elif depth_ratio < 0.6:
-        score -= 15
-        signals.append("卖方深度远超买方, 聪明钱可能出货")
-    elif depth_ratio < 0.8:
+    # 3) Funding 拥挤度（反向）
+    if frs and len(frs) >= 2:
+        fr_now = frs[-1]["rate"]
+        if fr_now > 0.0005:
+            score -= 8
+            signals.append(f"多头杠杆过热 (funding {fr_now:+.5f})")
+        elif fr_now < -0.0005:
+            score += 8
+            signals.append(f"空头杠杆过热 (funding {fr_now:+.5f})")
+
+    # 4) 价格位置 + 涨跌
+    if range_pos > 0.8 and change_pct > 10:
         score -= 8
-        signals.append("卖方深度略优")
-
-    # 高涨幅+买方深度弱 → 拉高出货
-    if change_pct > 15 and depth_ratio < 1.0:
-        score -= 15
-        signals.append(f"大涨({change_pct:+.1f}%)+卖方厚, 可能是拉高出货")
-
-    # 高跌幅+买方深度强 → 洗盘吸筹
-    if change_pct < -10 and depth_ratio > 1.5:
-        score += 15
-        signals.append(f"大跌({change_pct:+.1f}%)+买方厚, 可能是洗盘吸筹")
+        signals.append(f"高位大涨 ({change_pct:+.1f}%), 追高需谨慎")
+    elif range_pos < 0.2 and change_pct < -10:
+        score += 5
+        signals.append(f"低位大跌 ({change_pct:+.1f}%), 关注衰竭信号")
 
     score = max(10, min(95, score))
     detail = "; ".join(signals) if signals else "无明显聪明钱信号"
     conf = "medium" if signals else "low"
-    return {"score": score, "confidence": conf,
-            "source": "orderbook+funding",
+    return {"score": score, "confidence": conf, "source": "futures_ls+liq+funding",
+            "detail": detail}
+
+
+def _score_orderbook(data: dict) -> dict:
+    """
+    4.6 订单簿失衡评分 (Orderbook Score) — V2.0 新增
+    权重 10%（文档第7节：订单簿只保留一个独立因子，最大权重 ≤10%）
+
+    数据源: 币安订单簿（全引擎唯一使用订单簿的因子）
+    """
+    ob = _fetch_binance_orderbook(data.get("symbol", ""))
+    if ob is None:
+        return {"score": 50, "confidence": "low", "source": "default",
+                "detail": "无法获取订单簿数据，默认中性"}
+
+    ratio = ob["ratio"]
+    imbalance = ob["imbalance_pct"]
+
+    if imbalance > 30:
+        score = 85
+        detail = f"买方大幅占优 (买卖比 {ratio:.2f})"
+    elif imbalance > 15:
+        score = 72
+        detail = f"买方明显占优 (买卖比 {ratio:.2f})"
+    elif imbalance > 5:
+        score = 60
+        detail = f"买方略占优 (买卖比 {ratio:.2f})"
+    elif imbalance > -5:
+        score = 50
+        detail = f"买卖均衡 (买卖比 {ratio:.2f})"
+    elif imbalance > -15:
+        score = 40
+        detail = f"卖方略占优 (买卖比 {ratio:.2f})"
+    elif imbalance > -30:
+        score = 28
+        detail = f"卖方明显占优 (买卖比 {ratio:.2f})"
+    else:
+        score = 15
+        detail = f"卖方大幅占优 (买卖比 {ratio:.2f})"
+
+    return {"score": score, "confidence": "medium", "source": "binance_orderbook",
             "detail": detail}
 
 
@@ -657,6 +677,7 @@ def calc_whale_score(symbol: str) -> dict:
     transfer = _score_transfer(data)
     concentration = _score_concentration(data)
     smart_money = _score_smart_money(data)
+    orderbook = _score_orderbook(data)
 
     # 加权聚合
     ws = (
@@ -665,15 +686,16 @@ def calc_whale_score(symbol: str) -> dict:
         + transfer["score"] * WEIGHTS["transfer"]
         + concentration["score"] * WEIGHTS["concentration"]
         + smart_money["score"] * WEIGHTS["smart_money"]
+        + orderbook["score"] * WEIGHTS["orderbook"]
     )
 
     # 置信度：各因子置信度的加权平均
     conf_map = {"high": 1.0, "medium": 0.7, "low": 0.4}
     overall_conf = 0.0
-    for f in (exchange, holding, transfer, concentration, smart_money):
+    for f in (exchange, holding, transfer, concentration, smart_money, orderbook):
         conf_score = conf_map.get(f["confidence"], 0.5)
         overall_conf += conf_score
-    overall_conf /= 5.0
+    overall_conf /= 6.0
 
     # 等级标签
     if ws >= 80:
@@ -697,6 +719,7 @@ def calc_whale_score(symbol: str) -> dict:
             "transfer": transfer,
             "concentration": concentration,
             "smart_money": smart_money,
+            "orderbook": orderbook,
         },
     }
 

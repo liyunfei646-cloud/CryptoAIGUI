@@ -848,6 +848,52 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
             no_trade = True
             no_trade_reason = "4H/1H 双多头趋势，禁止做空"
 
+    # ── V2.0 Entry Trigger（入场触发器：位置+结构+量能确认，文档14/15/16节）──
+    entry_trigger = "WAIT"
+    trigger_met = []
+    trigger_missing = []
+    if not no_trade:
+        # 盈亏比（rr_short 可能未定义，重新计算）
+        rr_short_val = (sd / rd) if (sd is not None and rd is not None and rd > 0) else None
+        sup_ref = sd if sd is not None else sup_dist_pct_24h
+        res_ref = rd if rd is not None else res_dist_pct_24h
+        vol_ok = vol_ratio >= 1.2 or vol_analysis["signal"] == "volume_spike"
+        direction_now = "LONG" if long_score >= short_score else "SHORT"
+        if direction_now == "LONG":
+            checks = [
+                ("关键位置(贴近支撑/Fib回踩)",
+                 (sup_ref is not None and sup_ref <= 1.5) or
+                 (fib_near["nearest"] and fib_near["touch"] and price <= ema20_val)),
+                ("5M结构转多", trend_info["trend_5m"] == "bull"),
+                ("成交量确认", vol_ok),
+                ("流动性扫盘/假跌破", bool(patterns_15m.get("fake_break_below"))),
+                ("OI配合(新多进场)", derivatives.get("oi_trend") == "rising"),
+                ("Funding未过热", derivatives.get("funding_regime") not in ("extreme_long",)),
+                ("盈亏比≥1:2", rr_long is not None and rr_long >= 2.0),
+                ("环境允许", regime_name in ("RANGE", "TREND_UP", "CHAOS")),
+            ]
+        else:
+            checks = [
+                ("关键位置(贴近阻力/Fib回抽)",
+                 (res_ref is not None and res_ref <= 1.5) or
+                 (fib_near["nearest"] and fib_near["touch"] and price >= ema20_val)),
+                ("5M结构转空", trend_info["trend_5m"] == "bear"),
+                ("成交量确认", vol_ok),
+                ("流动性扫盘/假突破", bool(patterns_15m.get("fake_break_above"))),
+                ("OI配合(新空进场)", derivatives.get("oi_trend") == "rising"),
+                ("Funding未过热", derivatives.get("funding_regime") not in ("extreme_short",)),
+                ("盈亏比≥1:2", rr_short_val is not None and rr_short_val >= 2.0),
+                ("环境允许", regime_name in ("RANGE", "TREND_DOWN", "CHAOS")),
+            ]
+        for name, ok in checks:
+            (trigger_met if ok else trigger_missing).append(name)
+        core_ok = sum(1 for m in trigger_met
+                      if m.startswith("关键位置") or m.startswith("5M结构") or m.startswith("成交量"))
+        if len(trigger_met) >= 5 and core_ok >= 2:
+            entry_trigger = "READY"
+
+    signal_status = "NO_TRADE" if no_trade else entry_trigger
+
     # ── 计算概率 ──
     max_possible = 100
     net_score = long_score - short_score
@@ -916,6 +962,10 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "btc_regime": btc_regime_name,
         "no_trade": no_trade,
         "no_trade_reason": no_trade_reason,
+        "entry_trigger": entry_trigger,
+        "signal_status": signal_status,
+        "trigger_met": trigger_met,
+        "trigger_missing": trigger_missing,
         "oi": derivatives.get("oi"),
         "oi_change_5m": derivatives.get("oi_change_5m"),
         "oi_change_15m": derivatives.get("oi_change_15m"),
@@ -952,6 +1002,20 @@ def format_gui_details(d: dict) -> str:
         parts.append(f"🚫 {nt}")
     parts.append("")
 
+    # ── V2.0 信号状态 ──
+    st = d.get("signal_status", "WAIT")
+    if st == "READY":
+        parts.append("📡 信号状态: ✅ READY")
+    elif st == "NO_TRADE":
+        parts.append("📡 信号状态: 🚫 NO TRADE")
+    else:
+        parts.append("📡 信号状态: ⏸ WAIT")
+    if st == "WAIT" and d.get("trigger_missing"):
+        parts.append("   等待: " + ", ".join(d["trigger_missing"][:4]))
+    elif st == "READY" and d.get("trigger_met"):
+        parts.append("   已满足: " + ", ".join(d["trigger_met"]))
+    parts.append("")
+
     ema20 = d.get("ema20", 0)
     ema50 = d.get("ema50", 0)
     rsi_val = d.get("rsi", "—")
@@ -984,11 +1048,12 @@ def format_gui_details(d: dict) -> str:
     parts.append(f"   🐋 巨鲸评分: {ws:.0f}/100 {wl}")
     factors = d.get("whale_factors", {})
     factor_map = {
-        "exchange": ("交易所资金流", "30%"),
-        "holding": ("巨鲸持仓", "25%"),
-        "transfer": ("大额转账", "15%"),
-        "concentration": ("持仓集中度", "10%"),
-        "smart_money": ("聪明钱", "20%"),
+        "exchange": ("🏦 Taker资金流", "20%"),
+        "holding": ("🐳 持仓变化", "20%"),
+        "transfer": ("🔄 大额转账", "15%"),
+        "concentration": ("🎯 集中度", "5%"),
+        "smart_money": ("🧠 聪明钱", "30%"),
+        "orderbook": ("📚 订单簿", "10%"),
     }
     for fkey, (flabel, fweight) in factor_map.items():
         f = factors.get(fkey, {})
@@ -1117,9 +1182,13 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
     lines.append(f"{'='*56}")
     lines.append(f"  🦐 币安信号雷达  |  {symbol.upper()}  |  {now_str}")
     lines.append(f"  信号等级: {grade_tag}")
+    status_tag = {"NO_TRADE": "🚫 NO TRADE", "READY": "✅ READY", "WAIT": "⏸ WAIT"}
+    lines.append(f"  信号状态: {status_tag.get(score.get('signal_status', 'WAIT'), '⏸ WAIT')}")
     lines.append(f"  🌍 环境: {score.get('market_regime','RANGE')} (4H:{score.get('trend_4h','—')}/1H:{score.get('trend_1h','—')} | BTC:{score.get('btc_regime','—')})")
     if score.get("no_trade"):
         lines.append(f"  🚫 {score.get('no_trade_reason','')}")
+    elif score.get("signal_status") == "WAIT" and score.get("trigger_missing"):
+        lines.append(f"  ⏳ 缺: {', '.join(score['trigger_missing'][:4])}")
     lines.append(f"{'='*56}")
 
     if not brief:
@@ -1168,11 +1237,12 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
         lines.append(f"     {'■' * bars_ws}{'░' * (10 - bars_ws)}")
         # 5因子详细分解
         factor_map = {
-            "exchange": ("🏦 交易所资金流", "30%"),
-            "holding": ("🐳 巨鲸持仓", "25%"),
+            "exchange": ("🏦 Taker资金流", "20%"),
+            "holding": ("🐳 持仓变化", "20%"),
             "transfer": ("🔄 大额转账", "15%"),
-            "concentration": ("🎯 持仓集中度", "10%"),
-            "smart_money": ("🧠 聪明钱", "20%"),
+            "concentration": ("🎯 集中度", "5%"),
+            "smart_money": ("🧠 聪明钱", "30%"),
+            "orderbook": ("📚 订单簿", "10%"),
         }
         factors = score.get("whale_factors", {})
         for fkey, (flabel, fweight) in factor_map.items():
@@ -1335,6 +1405,35 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
         if score.get("no_trade"):
             risk["direction"] = "NEUTRAL"
 
+        # V2.0: 信号审计（记录有入场建议的信号 + 评估历史信号到期窗口）
+        try:
+            from signal_audit import save_signal, evaluate_pending
+            save_signal({
+                "id": f"{int(time.time() * 1000)}-{sym}",
+                "time": int(time.time() * 1000),
+                "symbol": sym,
+                "direction": risk["direction"],
+                "price": price,
+                "entry": risk.get("entry_price"),
+                "stop_loss": risk.get("stop_loss"),
+                "take_profit": risk.get("take_profit"),
+                "sl_pct": risk.get("sl_pct"),
+                "tp_pct": risk.get("tp_pct"),
+                "regime": score.get("market_regime"),
+                "grade": score.get("grade"),
+                "long_score": score.get("long_score"),
+                "short_score": score.get("short_score"),
+                "rsi": score.get("rsi"),
+                "volume_ratio": score.get("volume_ratio"),
+                "oi_trend": score.get("oi_trend"),
+                "funding_regime": score.get("funding_regime"),
+                "taker_trend": score.get("taker_trend"),
+                "entry_trigger": score.get("entry_trigger"),
+            })
+            evaluate_pending()
+        except Exception:
+            pass  # 审计失败不影响主流程
+
         grade_emojis = {"A": "🅰️", "B": "🅱️", "C": "©️", "D": "⚪", "N": "🚫"}  # emoji only, label in GUI's GRADE_NAMES
         dir_labels = {"LONG": "🟢 看多", "SHORT": "🔴 看空", "NEUTRAL": "⚪ 观望"}
 
@@ -1393,6 +1492,10 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "btc_regime": score.get("btc_regime", "RANGE"),
             "no_trade": score.get("no_trade", False),
             "no_trade_reason": score.get("no_trade_reason", ""),
+            "entry_trigger": score.get("entry_trigger", "WAIT"),
+            "signal_status": score.get("signal_status", "WAIT"),
+            "trigger_met": score.get("trigger_met", []),
+            "trigger_missing": score.get("trigger_missing", []),
             "oi": score.get("oi"),
             "oi_change_5m": score.get("oi_change_5m"),
             "oi_change_15m": score.get("oi_change_15m"),

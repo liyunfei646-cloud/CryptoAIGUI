@@ -48,14 +48,18 @@ def _http_get(url: str, timeout: int = 15) -> bytes:
     raise last_err
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200, closed_only: bool = False) -> list[dict]:
+def fetch_klines(symbol: str, interval: str, limit: int = 200, closed_only: bool = False, start_time: int = None) -> list[dict]:
     """
     closed_only=True 时剔除尚未收盘的K线（V2.0 要求：核心信号只用已收盘数据）。
+    start_time 用于回测分页拉历史（backtest_v2.py）。
     币安 klines 字段: k[0]=open_time, k[6]=close_time(ms)
     """
     sym = symbol.upper()
-    fapi_url = f"{BINANCE_FUTURES}/fapi/v1/klines?symbol={sym}&interval={interval}&limit={limit}"
-    spot_url = f"{BINANCE_SPOT}/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}"
+    params = f"symbol={sym}&interval={interval}&limit={limit}"
+    if start_time:
+        params += f"&startTime={start_time}"
+    fapi_url = f"{BINANCE_FUTURES}/fapi/v1/klines?{params}"
+    spot_url = f"{BINANCE_SPOT}/api/v3/klines?{params}"
     raw = None
     for url in (fapi_url, spot_url):
         try:
@@ -375,7 +379,7 @@ def score_trend(klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[d
             "tf_aligned": tf_aligned, "tf_dominant": tf_dominant}
 
 
-def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict, symbol: str = "", derivatives: dict = None, regime: dict = None, btc_regime: dict = None) -> dict:
+def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict, symbol: str = "", derivatives: dict = None, regime: dict = None, btc_regime: dict = None, whale_override: dict = None) -> dict:
     closes_15m = [k["close"] for k in klines_15m]
     closes_5m = [k["close"] for k in klines_5m]
     closes_1m = [k["close"] for k in klines_1m]
@@ -654,7 +658,11 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     ws = 50.0
     whale_result = {"grade_label": "中性 ➖", "confidence": 0.0}
     try:
-        whale_result = calc_whale_score(symbol)
+        if whale_override is not None:
+            # 回测模式：whale 因子中性化（实时 orderbook 无法回测）
+            whale_result = whale_override
+        else:
+            whale_result = calc_whale_score(symbol)
         ws = whale_result["whale_score"]
         wc = whale_result["confidence"]
         whale_impact = (ws - 50) / 50 * 12  # -12 ~ +12

@@ -25,6 +25,34 @@ STRATEGY_BREAKOUT = "BREAKOUT"
 
 ALL_STRATEGIES = (STRATEGY_TREND, STRATEGY_REVERSAL, STRATEGY_RANGE, STRATEGY_BREAKOUT)
 
+# ─── 交易域配置（V2.1，文档第32节：LONG 与 SHORT 必须独立验证）───
+# 取值:
+#   trend_up_long   只做 TREND_UP + 趋势延续 + LONG（默认。20天回测：方向过滤后整体由负转正，
+#                   PF 0.90→2.21；主流三币 PF 3.03。注意：样本内时间分布集中，尚未达"宣布有效"标准，
+#                   属研究阶段配置，靠 signal_audit 积累真实样本）
+#   all             全部候选方向（信息面板展示用，不产生交易建议）
+# 可通过环境变量 TRADE_DOMAIN 覆盖（回测/实盘共用同一信号定义，文档43节）
+import os as _os
+TRADE_DOMAIN = _os.environ.get("TRADE_DOMAIN", "trend_up_long").lower()
+
+
+def domain_allows(regime_name: str, strategy: str, direction: str) -> tuple:
+    """
+    交易域过滤：候选方向是否被允许交易。
+    返回 (allowed, reason)。域外候选 → NO_TRADE（不交易，不产生 READY）。
+    """
+    if TRADE_DOMAIN in ("all", ""):
+        return True, ""
+    if TRADE_DOMAIN == "trend_up_long":
+        if strategy == STRATEGY_TREND and regime_name == "TREND_UP" and direction == "LONG":
+            return True, ""
+        return False, f"交易域[trend_up_long]: 仅允许 TREND_UP+趋势延续+LONG"
+    if TRADE_DOMAIN == "long_only":
+        if direction == "LONG":
+            return True, ""
+        return False, "交易域[long_only]: 禁止做空"
+    return True, ""
+
 # 逆势策略需要额外满足的确认条件数（文档第19节：提高门槛）
 COUNTER_TREND_EXTRA_CONFIRM = 1
 

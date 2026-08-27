@@ -639,8 +639,16 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     # 确认门槛：顺势2 / 逆势+1 / 高波动+1（文档8.2/19节）
     need_confirm = required_confirm_count(counter_trend, regime.get("high_volatility", False))
 
+    # ── V2.1 交易域过滤（文档32节：方向独立验证；域外候选 → NO_TRADE）──
+    from strategy import domain_allows
+    domain_ok, domain_reason = domain_allows(regime_name, strategy, candidate_direction)
+
     # ── V2.1 状态机判定（文档25节）──
-    if strategy == STRATEGY_NONE:
+    if not domain_ok:
+        signal_status = "NO_TRADE"
+        no_trade = True
+        no_trade_reason = domain_reason
+    elif strategy == STRATEGY_NONE:
         signal_status = "NO_TRADE"
         no_trade = True
         no_trade_reason = strat.get("block_reason") or "无匹配策略/位置条件"

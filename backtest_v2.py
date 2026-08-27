@@ -290,23 +290,28 @@ def show(title: str, rows: list[dict]):
 def main():
     args = sys.argv[1:]
     experiment = "baseline"
+    tech_only = False
     if args and args[0].startswith("--experiment"):
         experiment = args[1] if len(args) > 1 else "baseline"
         args = args[2:]
         if experiment not in EXPERIMENTS:
             print(f"❌ 未知实验: {experiment}，可选: {list(EXPERIMENTS)}")
             return
+    if args and args[0] == "--tech-only":
+        tech_only = True
+        args = args[1:]
     symbol = args[0].upper() if args else "BTCUSDT"
     if not symbol.endswith("USDT"):
         symbol += "USDT"
     days = int(args[1]) if len(args) > 1 else 20
     strat_filter = EXPERIMENTS[experiment]
 
-    print(f"⏳ 拉取历史数据 {symbol} ({days}天) [实验: {experiment}]...", flush=True)
+    print(f"⏳ 拉取历史数据 {symbol} ({days}天) [实验: {experiment}][tech_only={tech_only}]...", flush=True)
     t0 = time.time()
     k5m = fetch_history(symbol, "5m", days + 1)
     k15m = fetch_history(symbol, "15m", days + 3)
-    k1m = fetch_history(symbol, "1m", days)
+    # V2.1 tech-only: 1m 仅用于多周期 context，只拉最近 2 天即可（早期决策点自动降级）
+    k1m = fetch_history(symbol, "1m", min(days, 2) if tech_only else days)
     k1h = fetch_history(symbol, "1h", days + 12)
     k4h = fetch_history(symbol, "4h", days + 40)
     oi_hist = fetch_oi_series(symbol, "1h", 500) or []
@@ -316,12 +321,21 @@ def main():
           f"1h×{len(k1h)} 4h×{len(k4h)} OI×{len(oi_hist)} Funding×{len(funding_hist)} "
           f"Taker×{len(taker_hist)} ({time.time()-t0:.0f}s)", flush=True)
 
-    # 决策区间：衍生品历史覆盖范围内
+    # 决策区间：衍生品历史覆盖范围内（V2.1: tech_only 时不受限，超出范围衍生品自动降级为 None）
+    now_ms = int(time.time() * 1000)
+    start_limit = now_ms - days * 86400_000
     deriv_end = min((oi_hist[-1]["time"] if oi_hist else 10**18),
                     (taker_hist[-1]["time"] if taker_hist else 10**18))
-    decision_ts = sorted(k["close_time"] for k in k1h
-                         if k["close_time"] <= deriv_end and k["close_time"] >= k1h[0]["close_time"] + 24 * 3600_000)
+    if tech_only:
+        decision_ts = sorted(k["close_time"] for k in k1h
+                             if k["close_time"] >= start_limit and k["close_time"] >= k1h[0]["close_time"] + 24 * 3600_000)
+    else:
+        decision_ts = sorted(k["close_time"] for k in k1h
+                             if k["close_time"] <= deriv_end and k["close_time"] >= start_limit and k["close_time"] >= k1h[0]["close_time"] + 24 * 3600_000)
+    deriv_days = round((deriv_end - decision_ts[0]) / 86400_000, 1) if decision_ts and deriv_end < 10**17 else days
     print(f"决策点: {len(decision_ts)} 个 (区间 {fmt_ts(decision_ts[0])} ~ {fmt_ts(decision_ts[-1])})", flush=True)
+    if tech_only:
+        print(f"⚠️  衍生品数据仅覆盖前 {deriv_days} 天，其余为纯技术面（OI/Taker 降级）", flush=True)
 
     k5m_by_time = k5m
     trades = []       # READY 信号（进入交易评估）

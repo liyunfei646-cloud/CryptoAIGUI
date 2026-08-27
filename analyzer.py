@@ -366,10 +366,14 @@ def score_trend(klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[d
     price_5m = closes_5m[-1]
     trend_5m = "bull" if ema20_5m > ema50_5m else "bear"
     closes_1m = [k["close"] for k in klines_1m]
-    ema20_1m = ema(closes_1m, 20)
-    ema50_1m = ema(closes_1m, 50)
-    price_1m = closes_1m[-1]
-    trend_1m = "bull" if ema20_1m > ema50_1m else "bear"
+    # V2.1: 1m 数据可能缺失（60天纯技术面回测只拉最近2天），降级用5m趋势
+    if len(closes_1m) >= 20:
+        ema20_1m = ema(closes_1m, 20)
+        ema50_1m = ema(closes_1m, 50)
+        price_1m = closes_1m[-1]
+        trend_1m = "bull" if ema20_1m > ema50_1m else "bear"
+    else:
+        trend_1m = trend_5m  # 降级
     tf_bullish = sum(1 for t in [trend_15m, trend_5m, trend_1m] if t == "bull")
     tf_aligned = tf_bullish == 3 or tf_bullish == 0
     tf_dominant = "bull" if tf_bullish >= 2 else "bear"

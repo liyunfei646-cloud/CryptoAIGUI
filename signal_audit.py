@@ -97,6 +97,15 @@ def save_signal(snapshot: dict):
         "funding_regime": snapshot.get("funding_regime"),
         "taker_trend": snapshot.get("taker_trend"),
         "entry_trigger": snapshot.get("entry_trigger"),
+        # ── V2.1 新增（文档44节自动审计字段）──
+        "strategy": snapshot.get("strategy"),
+        "setup": snapshot.get("setup"),
+        "candidate_direction": snapshot.get("candidate_direction"),
+        "trade_direction": snapshot.get("trade_direction"),
+        "signal_status": snapshot.get("signal_status"),
+        "reason_codes": snapshot.get("reason_codes", []),
+        "regime_strength": snapshot.get("regime_strength"),
+        "volatility_state": snapshot.get("volatility_state"),
         "outcomes": {},
         "evaluated_at": None,
     }

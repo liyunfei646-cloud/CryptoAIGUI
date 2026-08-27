@@ -43,15 +43,22 @@ BINANCE_API = "https://api.binance.com"
 BINANCE_FUTURES = "https://fapi.binance.com"
 TZ = timezone(timedelta(hours=8))
 
-# 评分因子权重（V2.0 去重后重新分配）
+# 评分因子权重（V2.1: transfer/concentration 伪因子停用，文档13节）
+#  - transfer: 用 ticker count/成交额代理"大额转账"，无真实链上数据 → 退出决策
+#  - concentration: 用 CoinGecko Rank 推断持仓集中度（市值排名≠地址集中度）→ 删除
+#  - smart_money: 实际基于 OI/Funding/强平/多空比，改名 Positioning（文档14节）
+# 权重重新归一化到剩余 4 因子（保留 orderbook 10% 上限，文档15节）
 WEIGHTS = {
-    "exchange": 0.20,
-    "holding": 0.20,
-    "transfer": 0.15,
-    "concentration": 0.05,
-    "smart_money": 0.30,
+    "exchange": 0.25,
+    "holding": 0.25,
+    "transfer": 0.0,          # 停用
+    "concentration": 0.0,     # 停用
+    "smart_money": 0.40,      # 已改名为 Positioning
     "orderbook": 0.10,
 }
+
+# 停用的伪因子（仅保留显示，不参与加权）
+DISABLED_FACTORS = ("transfer", "concentration")
 
 _DATA_CACHE: dict = {}
 _CACHE_TTL = 60  # 秒 — 超短线场景缓存较短
@@ -664,8 +671,13 @@ def calc_whale_score(symbol: str) -> dict:
     """
     计算 Whale Score 综合评分。
 
+    V2.1 变更：
+      - transfer / concentration 伪因子停用（不参与加权，仅保留 detail 供显示）
+      - smart_money 因子改名为 positioning（实际数据为 OI/Funding/强平/多空比）
+      - 本评分仅供信息展示；不再参与交易决策（analyzer 中已移除）
+
     返回:
-      whale_score    : 0~100 综合分
+      whale_score    : 0~100 综合分（仅活跃因子加权）
       grade_label    : 极度看空 / 偏空 / 中性 / 偏多 / 极度看多
       factors        : 各因子详情
       confidence     : overall 置信度
@@ -679,23 +691,36 @@ def calc_whale_score(symbol: str) -> dict:
     smart_money = _score_smart_money(data)
     orderbook = _score_orderbook(data)
 
-    # 加权聚合
-    ws = (
-        exchange["score"] * WEIGHTS["exchange"]
-        + holding["score"] * WEIGHTS["holding"]
-        + transfer["score"] * WEIGHTS["transfer"]
-        + concentration["score"] * WEIGHTS["concentration"]
-        + smart_money["score"] * WEIGHTS["smart_money"]
-        + orderbook["score"] * WEIGHTS["orderbook"]
-    )
+    factors = {
+        "exchange": exchange,
+        "holding": holding,
+        "transfer": transfer,
+        "concentration": concentration,
+        "smart_money": smart_money,
+        "orderbook": orderbook,
+    }
+    # V2.1: smart_money → positioning 别名
+    factors["positioning"] = smart_money
 
-    # 置信度：各因子置信度的加权平均
+    # 加权聚合（仅活跃因子；停用因子权重为 0）
+    ws = 0.0
+    w_sum = 0.0
+    active = []
+    for fname, w in WEIGHTS.items():
+        if w <= 0 or fname not in factors:
+            continue
+        ws += factors[fname]["score"] * w
+        w_sum += w
+        active.append(fname)
+    if w_sum > 0:
+        ws /= w_sum
+
+    # 置信度：活跃因子置信度的加权平均
     conf_map = {"high": 1.0, "medium": 0.7, "low": 0.4}
     overall_conf = 0.0
-    for f in (exchange, holding, transfer, concentration, smart_money, orderbook):
-        conf_score = conf_map.get(f["confidence"], 0.5)
-        overall_conf += conf_score
-    overall_conf /= 6.0
+    for fname in active:
+        overall_conf += conf_map.get(factors[fname].get("confidence", "low"), 0.5)
+    overall_conf /= len(active) if active else 1.0
 
     # 等级标签
     if ws >= 80:
@@ -713,14 +738,8 @@ def calc_whale_score(symbol: str) -> dict:
         "whale_score": round(ws, 1),
         "grade_label": label,
         "confidence": round(overall_conf, 2),
-        "factors": {
-            "exchange": exchange,
-            "holding": holding,
-            "transfer": transfer,
-            "concentration": concentration,
-            "smart_money": smart_money,
-            "orderbook": orderbook,
-        },
+        "factors": factors,
+        "disabled_factors": list(DISABLED_FACTORS),
     }
 
 

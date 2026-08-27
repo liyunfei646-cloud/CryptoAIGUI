@@ -268,7 +268,8 @@ def build_derivatives_context(symbol: str) -> dict:
         "oi": None,
         "oi_change_5m": None, "oi_change_15m": None, "oi_change_1h": None,
         "oi_trend": "unknown",
-        "funding_rate": None, "funding_series": [], "funding_trend": "flat",
+        "funding_rate": None, "funding_level": None, "funding_series": [],
+        "funding_trend": "flat", "funding_acceleration": 0.0,
         "funding_regime": "normal",
         "taker_ratio": None, "taker_buy_vol": None, "taker_sell_vol": None,
         "taker_ratio_1h_ago": None, "taker_trend": "neutral",
@@ -312,13 +313,14 @@ def build_derivatives_context(symbol: str) -> dict:
     except Exception as e:
         ctx["errors"]["oi_hist"] = str(e)
 
-    # 3) Funding 历史结算趋势
+    # 3) Funding 历史结算趋势（V2.1: level / trend / acceleration 三要素，文档17节）
     try:
-        frs = fetch_funding_series(sym, 6)
+        frs = fetch_funding_series(sym, 8)
         if frs:
             ctx["funding_series"] = frs
             rates = [r["rate"] for r in frs]
             ctx["funding_rate"] = rates[-1]
+            ctx["funding_level"] = rates[-1]
             if len(rates) >= 4:
                 recent = rates[-4:]
                 up = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
@@ -327,6 +329,15 @@ def build_derivatives_context(symbol: str) -> dict:
                     ctx["funding_trend"] = "rising"
                 elif dn >= 3:
                     ctx["funding_trend"] = "falling"
+                else:
+                    ctx["funding_trend"] = "flat"
+            # acceleration: 最近两段结算的变化（区分"高且继续升高"与"高但快速下降"）
+            if len(rates) >= 3:
+                ctx["funding_acceleration"] = rates[-1] - rates[-2]
+            elif len(rates) >= 2:
+                ctx["funding_acceleration"] = rates[-1] - rates[-2]
+            else:
+                ctx["funding_acceleration"] = 0.0
             fr = ctx["funding_rate"]
             if fr is not None:
                 if fr >= 0.0005:
@@ -398,7 +409,9 @@ def detect_market_regime(klines_4h: list[dict], klines_1h: list[dict],
       CHAOS        周期矛盾 / 数据不足 / 高波动无方向
     附加：high_volatility 标志（4H ATR% 超阈值）
     """
-    default = {"regime": "CHAOS", "trend_4h": "FLAT", "trend_1h": "FLAT",
+    default = {"regime": "CHAOS", "regime_name": "CHAOS",
+               "regime_strength": 0.0, "volatility_state": "UNKNOWN",
+               "trend_4h": "FLAT", "trend_1h": "FLAT",
                "atr_pct": 0.0, "high_volatility": False,
                "range_high": None, "range_low": None,
                "ema50_4h": None, "ema200_4h": None, "reasons": ["数据不足"]}
@@ -454,6 +467,13 @@ def detect_market_regime(klines_4h: list[dict], klines_1h: list[dict],
     in_range = all(abs(c - ema50_4h) <= 1.5 * atr4 for c in recent) if atr4 > 0 else False
 
     high_vol = atr_pct > vol_threshold_pct
+    # V2.1: 波动率状态（NORMAL / HIGH / EXTREME）
+    if atr_pct > vol_threshold_pct * 2:
+        volatility_state = "EXTREME"
+    elif atr_pct > vol_threshold_pct:
+        volatility_state = "HIGH"
+    else:
+        volatility_state = "NORMAL"
     reasons = []
 
     if breakout_up:
@@ -484,8 +504,22 @@ def detect_market_regime(klines_4h: list[dict], klines_1h: list[dict],
     if high_vol:
         reasons.append(f"高波动 (4H ATR {atr_pct:.1f}%)")
 
+    # V2.1: regime_strength（0~1，趋势/突破的明确程度）
+    if regime in ("TREND_UP", "TREND_DOWN"):
+        regime_strength = min(1.0, ema_gap / 1.5)
+    elif regime in ("BREAKOUT", "BREAKDOWN"):
+        dist = abs(price - (range_high if regime == "BREAKOUT" else range_low))
+        regime_strength = min(1.0, dist / (2 * atr4)) if atr4 > 0 else 0.6
+    elif regime == "RANGE":
+        regime_strength = 0.3
+    else:
+        regime_strength = 0.2
+
     return {
         "regime": regime,
+        "regime_name": regime,  # V2.1 别名（文档18节）
+        "regime_strength": round(regime_strength, 2),
+        "volatility_state": volatility_state,
         "trend_4h": trend_4h,
         "trend_1h": trend_1h,
         "atr_pct": round(atr_pct, 2),

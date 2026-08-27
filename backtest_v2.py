@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-backtest_v2.py — V2.0 系统历史回测（无未来函数）
+backtest_v2.py — V2.1 系统历史回测（无未来函数）
 ==================================================
-用法: python3 backtest_v2.py [SYMBOL] [DAYS]
-默认: BTCUSDT 20 天（衍生品历史覆盖上限 ~20.8 天，币安 limit=500）
+对应《V2.0代码整改与V2.1策略研究实施说明》第 4/28/29/30/31/32/33/34/35/36/37/43 节。
+
+用法:
+  python3 backtest_v2.py [SYMBOL] [DAYS]
+  python3 backtest_v2.py --experiment <name> [SYMBOL] [DAYS]
+    experiment: baseline | no_whale | trend_only | reversal_only | range_only | breakout_only
+
+V2.1 修复：
+  - P0-2: 仅 signal_status == "READY" 的信号进入交易评估（WAIT 不算 LOSS）
+  - P0-5: 回测与实时共用 analyzer.score_system（同一信号定义）
+  - 同 K 触及 SL/TP → 保守 SL first（文档29节）
+  - 交易成本：taker fee 0.05%×2 + slippage 0.02%×2 + funding 0.01%（文档28节）
+  - 分组：LONG/SHORT / Strategy / Regime / Symbol / 置信度（文档32-35节）
+  - 指标：Expectancy / PF / median / avg_win / avg_loss / MaxDD / MAE / MFE（文档30/31节）
 
 方法：
-  决策点 = 每根 1h K线收盘时刻（最近 N 天，全部采样）
-  每个决策点只用截至该时刻【已收盘】数据构造完整上下文：
-    - K线切片: 15m×200 / 5m×100 / 1m×60（决策点前已收盘）
-    - ticker:  从前 24 根 1h 构造（change_pct/high/low/quote_volume）
-    - funding: 历史 fundingRate 序列取最近值 → signal 判定（与线上同阈值）
-    - derivatives: 历史 OI(1h粒度)/Taker(1h粒度) 取决策点时刻值
-                  （5m/15m OI 变化无历史 → 降级用 1h 变化）
-    - regime/btc_regime: 截至 t 的 4h/1h 计算（detect_market_regime）
-    - whale: 中性（实时 orderbook 无历史，无法回测）
+  决策点 = 每根 1h K线收盘时刻（全部采样）
+  每个决策点只用截至该时刻【已收盘】数据构造完整上下文（文档41/42节）
   评估：信号后 60m/4h 窗口，5m 粒度追踪 SL/TP/收益（价格收益，不含杠杆）
-
-输出：方向胜率 / regime分桶 / 置信度分桶 / EntryTrigger分桶 / 硬过滤对照
 """
 
 import json
@@ -32,6 +35,19 @@ from futures_data import detect_market_regime
 TZ = timezone.utc
 WHALE_NEUTRAL = {"whale_score": 50.0, "confidence": 0.0,
                  "grade_label": "中性 ➖", "factors": {}}
+
+# V2.1: 交易成本（文档28节）— taker 0.05%×2 + slippage 0.02%×2 + funding 估算 0.01%
+COST_PCT = 0.05 * 2 + 0.02 * 2 + 0.01
+
+# 实验过滤（文档36/37节）
+EXPERIMENTS = {
+    "baseline": None,          # 全部策略
+    "no_whale": None,          # whale 已在决策中移除，等同 baseline
+    "trend_only": "TREND_CONTINUATION",
+    "reversal_only": "LIQUIDITY_REVERSAL",
+    "range_only": "RANGE_REVERSION",
+    "breakout_only": "BREAKOUT",
+}
 
 
 def fmt_ts(ms: int) -> str:
@@ -96,7 +112,8 @@ def build_hist_derivatives(t: int, oi_hist: list[dict], funding_hist: list[dict]
     ctx = {
         "oi": None, "oi_change_5m": None, "oi_change_15m": None, "oi_change_1h": None,
         "oi_trend": "unknown",
-        "funding_rate": None, "funding_series": [], "funding_trend": "flat",
+        "funding_rate": None, "funding_level": None, "funding_series": [],
+        "funding_trend": "flat", "funding_acceleration": 0.0,
         "funding_regime": "normal",
         "taker_ratio": None, "taker_buy_vol": None, "taker_sell_vol": None,
         "taker_ratio_1h_ago": None, "taker_trend": "neutral",
@@ -111,17 +128,19 @@ def build_hist_derivatives(t: int, oi_hist: list[dict], funding_hist: list[dict]
         if prev > 0:
             chg1h = (cur - prev) / prev * 100
             ctx["oi_change_1h"] = round(chg1h, 2)
+            ctx["oi_change_15m"] = round(chg1h, 2)  # 回测降级：1h 粒度近似
             if chg1h > 1.0:
                 ctx["oi_trend"] = "rising"
             elif chg1h < -1.0:
                 ctx["oi_trend"] = "falling"
             else:
                 ctx["oi_trend"] = "flat"
-    # Funding
+    # Funding（含 V2.1 level/trend/acceleration）
     fr_pts = [p for p in funding_hist if p["time"] <= t]
     if fr_pts:
         rates = [p["rate"] for p in fr_pts[-6:]]
         ctx["funding_rate"] = rates[-1]
+        ctx["funding_level"] = rates[-1]
         ctx["funding_series"] = fr_pts[-6:]
         if len(rates) >= 4:
             recent = rates[-4:]
@@ -131,6 +150,10 @@ def build_hist_derivatives(t: int, oi_hist: list[dict], funding_hist: list[dict]
                 ctx["funding_trend"] = "rising"
             elif dn >= 3:
                 ctx["funding_trend"] = "falling"
+            else:
+                ctx["funding_trend"] = "flat"
+        if len(rates) >= 2:
+            ctx["funding_acceleration"] = rates[-1] - rates[-2]
         fr = ctx["funding_rate"]
         if fr is not None:
             if fr >= 0.0005:
@@ -163,7 +186,11 @@ def slice_before(klines: list[dict], t: int, n: int) -> list[dict]:
 
 def evaluate_trade(entry: float, sl: float, tp: float, direction: str,
                    k5m_after: list[dict], t: int) -> dict:
-    """5m 粒度追踪：60m/4h 双窗口。返回收益(%)与 SL/TP 命中。"""
+    """
+    5m 粒度追踪：60m/4h 双窗口。
+    V2.1: 同 K 同时触及 SL/TP → 保守 SL first（文档29节）；含交易成本（文档28节）。
+    返回收益(%)（已扣成本）与 SL/TP 命中。
+    """
     out = {}
     for label, horizon_ms in (("60m", 60 * 60_000), ("4h", 4 * 3600_000)):
         end_t = t + horizon_ms
@@ -178,42 +205,69 @@ def evaluate_trade(entry: float, sl: float, tp: float, direction: str,
             if direction == "LONG":
                 mfe = max(mfe, (hi - entry) / entry * 100)
                 mae = min(mae, (lo - entry) / entry * 100)
-                if not tp_hit and hi >= tp:
-                    tp_hit = True
-                    ret = (tp - entry) / entry * 100
-                    break
+                # SL first：先检查止损（保守规则）
                 if lo <= sl:
                     sl_hit = True
-                    ret = (sl - entry) / entry * 100
+                    ret = (sl - entry) / entry * 100 - COST_PCT
+                    break
+                if hi >= tp:
+                    tp_hit = True
+                    ret = (tp - entry) / entry * 100 - COST_PCT
                     break
             else:
                 mfe = max(mfe, (entry - lo) / entry * 100)
                 mae = min(mae, (entry - hi) / entry * 100)
-                if not tp_hit and lo <= tp:
-                    tp_hit = True
-                    ret = (entry - tp) / entry * 100
-                    break
                 if hi >= sl:
                     sl_hit = True
-                    ret = (entry - sl) / entry * 100
+                    ret = (entry - sl) / entry * 100 - COST_PCT
+                    break
+                if lo <= tp:
+                    tp_hit = True
+                    ret = (entry - tp) / entry * 100 - COST_PCT
                     break
             last_close = k["close"]
         if not (sl_hit or tp_hit):
-            ret = ((last_close - entry) / entry * 100) if direction == "LONG" \
-                else ((entry - last_close) / entry * 100)
+            ret = ((last_close - entry) / entry * 100 - COST_PCT) if direction == "LONG" \
+                else ((entry - last_close) / entry * 100 - COST_PCT)
         out[label] = {"ret": ret, "mfe": mfe, "mae": mae, "sl_hit": sl_hit, "tp_hit": tp_hit}
     return out
 
 
 def agg(rows: list[dict]) -> dict:
+    """V2.1 指标集（文档30/31节）：胜率/均值/中位数/盈亏比/PF/Expectancy/MaxDD/MAE/MFE。"""
     n = len(rows)
     if n == 0:
         return {"n": 0}
-    wins = sum(1 for r in rows if r["ret_4h"] > 0)
+    rets = [r["ret_4h"] for r in rows]
+    wins = [x for x in rets if x > 0]
+    losses = [x for x in rets if x <= 0]
+    aw = sum(wins) / len(wins) if wins else 0.0
+    al = sum(losses) / len(losses) if losses else 0.0
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    pf = (gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+    wr = len(wins) / n
+    expectancy = wr * aw - (1 - wr) * abs(al)
+    # Max Drawdown（按时间顺序累计收益）
+    eq = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in sorted(rows, key=lambda x: x["time"]):
+        eq += r["ret_4h"]
+        peak = max(peak, eq)
+        max_dd = min(max_dd, eq - peak)
+    rets_sorted = sorted(rets)
+    median_ret = rets_sorted[n // 2] if n % 2 else (rets_sorted[n // 2 - 1] + rets_sorted[n // 2]) / 2
     return {
         "n": n,
-        "win_rate": round(wins / n * 100, 1),
-        "avg_ret": round(sum(r["ret_4h"] for r in rows) / n, 3),
+        "win_rate": round(wr * 100, 1),
+        "avg_ret": round(sum(rets) / n, 3),
+        "median_ret": round(median_ret, 3),
+        "avg_win": round(aw, 3),
+        "avg_loss": round(al, 3),
+        "profit_factor": round(pf, 2) if pf != float("inf") else "inf",
+        "expectancy": round(expectancy, 3),
+        "max_dd": round(max_dd, 2),
         "avg_mfe": round(sum(r["mfe_4h"] for r in rows) / n, 3),
         "avg_mae": round(sum(r["mae_4h"] for r in rows) / n, 3),
         "sl_hit": round(sum(1 for r in rows if r["sl_hit_4h"]) / n * 100, 1),
@@ -222,13 +276,33 @@ def agg(rows: list[dict]) -> dict:
     }
 
 
+def show(title: str, rows: list[dict]):
+    a = agg(rows)
+    if a["n"] == 0:
+        print(f"\n  {title}: 无样本")
+        return
+    print(f"\n  {title}: n={a['n']}")
+    print(f"    胜率(4h) {a['win_rate']}% | 60m胜率 {a['win_rate_60m']}% | avg {a['avg_ret']:+.3f}% | median {a['median_ret']:+.3f}%")
+    print(f"    avg_win {a['avg_win']:+.3f}% | avg_loss {a['avg_loss']:+.3f}% | PF {a['profit_factor']} | Expectancy {a['expectancy']:+.3f}%")
+    print(f"    MaxDD {a['max_dd']}% | MFE {a['avg_mfe']:.2f}% | MAE {a['avg_mae']:.2f}% | SL {a['sl_hit']}% | TP {a['tp_hit']}%")
+
+
 def main():
-    symbol = sys.argv[1].upper() if len(sys.argv) > 1 else "BTCUSDT"
+    args = sys.argv[1:]
+    experiment = "baseline"
+    if args and args[0].startswith("--experiment"):
+        experiment = args[1] if len(args) > 1 else "baseline"
+        args = args[2:]
+        if experiment not in EXPERIMENTS:
+            print(f"❌ 未知实验: {experiment}，可选: {list(EXPERIMENTS)}")
+            return
+    symbol = args[0].upper() if args else "BTCUSDT"
     if not symbol.endswith("USDT"):
         symbol += "USDT"
-    days = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    days = int(args[1]) if len(args) > 1 else 20
+    strat_filter = EXPERIMENTS[experiment]
 
-    print(f"⏳ 拉取历史数据 {symbol} ({days}天)...", flush=True)
+    print(f"⏳ 拉取历史数据 {symbol} ({days}天) [实验: {experiment}]...", flush=True)
     t0 = time.time()
     k5m = fetch_history(symbol, "5m", days + 1)
     k15m = fetch_history(symbol, "15m", days + 3)
@@ -250,9 +324,8 @@ def main():
     print(f"决策点: {len(decision_ts)} 个 (区间 {fmt_ts(decision_ts[0])} ~ {fmt_ts(decision_ts[-1])})", flush=True)
 
     k5m_by_time = k5m
-    trades = []       # 有明确方向(≥60%)的信号
-    blocked = []      # 被硬过滤拦下的信号（对照）
-    all_rows = []     # 全部决策点（含 NEUTRAL，不入 trade 统计）
+    trades = []       # READY 信号（进入交易评估）
+    skipped = []      # 非 READY 决策点（WAIT/NO_TRADE，统计分布但不评估）
 
     for i, t in enumerate(decision_ts):
         if i % 60 == 0:
@@ -279,70 +352,96 @@ def main():
                                  btc_regime=regime, whale_override=WHALE_NEUTRAL)
         except Exception:
             continue
-        lp, sp = score.get("long_probability", 50), score.get("short_probability", 50)
-        if max(lp, sp) < 60:
-            continue  # 无明确方向，不构成信号
-        direction = "LONG" if lp > sp else "SHORT"
+
+        status = score.get("signal_status", "WAIT")
+        cand = score.get("candidate_direction", "NEUTRAL")
+        strategy = score.get("strategy", "NONE")
+        # 实验过滤（文档37节）：只保留指定策略的 READY 信号
+        if status == "READY" and strat_filter and strategy != strat_filter:
+            status = "WAIT"  # 被实验过滤 → 统计为跳过
+
+        base_row = {
+            "time": t, "ts": fmt_ts(t), "price": price,
+            "regime": score.get("market_regime"), "grade": score.get("grade"),
+            "strategy": strategy, "setup": score.get("setup"),
+            "candidate_direction": cand,
+            "signal_status": status,
+            "counter_trend": bool(score.get("counter_trend")),
+            "confidence": score.get("score_confidence", 0),
+            "need_confirm": score.get("need_confirm", 0),
+            "confirm_count": score.get("confirm_count", 0),
+        }
+
+        if status != "READY":
+            skipped.append(base_row)
+            continue
+
+        trade_direction = score.get("trade_direction", "NEUTRAL")
+        if trade_direction not in ("LONG", "SHORT"):
+            skipped.append(base_row)
+            continue
         try:
             risk = risk_recommendation(price, score, 1000)
         except Exception:
             continue
         entry, sl, tp = risk["entry_price"], risk["stop_loss"], risk["take_profit"]
         if not (entry and sl and tp):
+            skipped.append(base_row)
             continue
         # 评估：决策点后 5m 已收盘 K 线
         k5m_after = [k for k in k5m_by_time if k["close_time"] > t]
-        ev = evaluate_trade(entry, sl, tp, direction, k5m_after, t)
+        ev = evaluate_trade(entry, sl, tp, trade_direction, k5m_after, t)
 
-        row = {
-            "time": t, "ts": fmt_ts(t), "price": price, "direction": direction,
-            "regime": score.get("market_regime"), "grade": score.get("grade"),
-            "confidence": risk["confidence"],
-            "entry_trigger": score.get("entry_trigger"),
-            "no_trade": bool(score.get("no_trade")),
+        row = dict(base_row)
+        row.update({
+            "direction": trade_direction,
+            "entry": entry, "sl": sl, "tp": tp,
             "sl_pct": risk["sl_pct"], "tp_pct": risk["tp_pct"],
             "rr": risk["rr_ratio"], "sl_basis": risk.get("sl_basis"),
             "ret_4h": ev["4h"]["ret"], "mfe_4h": ev["4h"]["mfe"], "mae_4h": ev["4h"]["mae"],
             "sl_hit_4h": ev["4h"]["sl_hit"], "tp_hit_4h": ev["4h"]["tp_hit"],
             "ret_60m": ev["60m"]["ret"],
-        }
-        all_rows.append(row)
-        if row["no_trade"]:
-            blocked.append(row)
-        else:
-            trades.append(row)
+        })
+        trades.append(row)
 
     # ── 报告 ──
-    print("\n" + "=" * 62)
-    print(f"  V2.0 回测报告 | {symbol} | {days}天 | {fmt_ts(decision_ts[0])} ~ {fmt_ts(decision_ts[-1])}")
-    print("=" * 62)
-    print(f"  决策点: {len(decision_ts)} | 方向信号: {len(all_rows)} | 可交易(未被硬过滤): {len(trades)} | 被拦下: {len(blocked)}")
-    print(f"  ⚠️  whale 因子中性化（orderbook 无历史）; OI/Taker 用 1h 粒度近似")
+    print("\n" + "=" * 70)
+    print(f"  V2.1 回测报告 | {symbol} | {days}天 | 实验: {experiment} | "
+          f"{fmt_ts(decision_ts[0])} ~ {fmt_ts(decision_ts[-1])}")
+    print("=" * 70)
+    print(f"  决策点: {len(decision_ts)} | READY交易: {len(trades)} | 跳过(WAIT/NO_TRADE/过滤): {len(skipped)}")
+    print(f"  成本: {COST_PCT:.2f}%/笔 (fee+slip+funding) | SL/TP 同K保守SL first")
 
-    def show(title, rows):
-        a = agg(rows)
-        if a["n"] == 0:
-            print(f"\n  {title}: 无样本")
-            return
-        print(f"\n  {title}: n={a['n']} | 胜率(4h) {a['win_rate']}% | 60m胜率 {a['win_rate_60m']}% | "
-              f"avg_ret {a['avg_ret']:+.3f}% | MFE {a['avg_mfe']:.2f}% MAE {a['avg_mae']:.2f}% | "
-              f"SL命中 {a['sl_hit']}% TP命中 {a['tp_hit']}%")
+    # 跳过分布
+    if skipped:
+        from collections import Counter
+        st_cnt = Counter(r["signal_status"] for r in skipped)
+        print(f"  跳过分布: {dict(st_cnt)}")
+        if strat_filter:
+            print(f"  (实验 {experiment} 过滤掉非 {strat_filter} 的 READY 信号)")
 
-    show("全部方向信号", all_rows)
-    show("   ├ 可交易(硬过滤放行)", trades)
-    show("   └ 被硬过滤拦下(对照)", blocked)
+    show("全部 READY 交易", trades)
 
     for d in ("LONG", "SHORT"):
         show(f"按方向 [{d}]", [r for r in trades if r["direction"] == d])
 
-    # regime 分桶（可交易集）
-    print("\n  ── regime × 方向 ──")
+    # Strategy 分组（文档35节）
+    print("\n  ── Strategy × Direction ──")
+    for st in sorted({r["strategy"] for r in trades}):
+        for d in ("LONG", "SHORT"):
+            rows = [r for r in trades if r["strategy"] == st and r["direction"] == d]
+            if rows:
+                show(f"  {st} + {d}", rows)
+
+    # Regime 分组（文档34节）
+    print("\n  ── Regime × Direction ──")
     for reg in sorted({r["regime"] for r in trades}):
         for d in ("LONG", "SHORT"):
             rows = [r for r in trades if r["regime"] == reg and r["direction"] == d]
             if rows:
                 show(f"  {reg} + {d}", rows)
-    # 顺势/逆势
+
+    # 顺势 / 逆势（文档19节）
     def trend_kind(r):
         reg, d = r["regime"], r["direction"]
         if ("UP" in reg and d == "LONG") or ("DOWN" in reg and d == "SHORT"):
@@ -355,26 +454,17 @@ def main():
 
     # 置信度分桶
     print("\n  ── 置信度分桶 ──")
-    for lo, hi in ((60, 70), (70, 80), (80, 101)):
+    for lo, hi in ((0, 60), (60, 70), (70, 80), (80, 101)):
         show(f"  置信度 {lo}-{hi}%", [r for r in trades if lo <= r["confidence"] < hi])
 
-    # Entry Trigger 分桶
-    print("\n  ── Entry Trigger ──")
-    for st in ("READY", "WAIT"):
-        show(f"  {st}", [r for r in trades if r["entry_trigger"] == st])
-
-    # 止损依据分桶
-    print("\n  ── 止损依据 ──")
-    for b in ("结构低点", "结构高点", "ATR"):
-        show(f"  {b}", [r for r in trades if r["sl_basis"] == b])
-
     # 落盘
-    out_path = f"backtest_{symbol}_{days}d.json"
+    out_path = f"backtest_{symbol}_{days}d_{experiment}.json"
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"symbol": symbol, "days": days,
+        json.dump({"symbol": symbol, "days": days, "experiment": experiment,
                    "decision_ts": [fmt_ts(x) for x in (decision_ts[0], decision_ts[-1])],
-                   "rows": all_rows}, f, ensure_ascii=False, indent=1)
-    print(f"\n📁 明细已存: {out_path} (共 {len(all_rows)} 条)")
+                   "cost_pct": COST_PCT,
+                   "trades": trades, "skipped": skipped}, f, ensure_ascii=False, indent=1)
+    print(f"\n📁 明细已存: {out_path} (READY {len(trades)} 条 / 跳过 {len(skipped)} 条)")
 
 
 if __name__ == "__main__":

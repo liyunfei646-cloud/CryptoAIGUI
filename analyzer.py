@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 from whale_score_engine import calc_whale_score, WEIGHTS
 # ─── V2.0 衍生品数据层 + Market Regime ──────────────────────────────
 from futures_data import build_derivatives_context, detect_market_regime
+from strategy import detect_strategy, required_confirm_count, STRATEGY_NONE
 
 # ─── 配置 ────────────────────────────────────────────────────────────────
 BINANCE_SPOT = "https://api.binance.com"
@@ -380,17 +381,34 @@ def score_trend(klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[d
 
 
 def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], klines_1m: list[dict], ticker: dict, funding: dict, symbol: str = "", derivatives: dict = None, regime: dict = None, btc_regime: dict = None, whale_override: dict = None) -> dict:
+    """
+    V2.1 信号引擎核心（《V2.0代码整改与V2.1策略研究实施说明》第2/3/5/7/8/18/19/21/22节）。
+
+    流程：Market Regime → Strategy → Candidate Direction → 必要条件 → 确认条件 → READY/WAIT
+
+    语义（V2.1 修复）：
+      - signal_status : NO_TRADE(无策略假设) / WAIT(条件未满足) / READY(可交易)
+      - candidate_direction : 策略假设的方向（观察状态，可保留方向但不交易）
+      - trade_direction     : 仅 READY 时有 LONG/SHORT，否则 NEUTRAL
+      - long_probability / short_probability 是评分映射的 score_implied 伪概率，
+        不是统计胜率（文档第5节），禁止解释为"历史盈利概率"
+      - WAIT 是观察状态，不是失败交易（文档第4节）
+      - RSI/MACD/EMA 降级为 Context，不再直接加减分（文档第20节）
+      - OI/Funding 表达市场状态，不再机械当作方向票（文档第16/17节）
+      - Whale 评分退出交易决策，仅供显示（文档原则6）
+    """
     closes_15m = [k["close"] for k in klines_15m]
     closes_5m = [k["close"] for k in klines_5m]
     closes_1m = [k["close"] for k in klines_1m]
 
     # V2.0: Market Regime / 衍生品上下文（缺省时保守回退）
     if regime is None:
-        regime = {"regime": "RANGE", "trend_4h": "FLAT", "trend_1h": "FLAT",
+        regime = {"regime": "RANGE", "regime_name": "RANGE", "trend_4h": "FLAT", "trend_1h": "FLAT",
                   "high_volatility": False, "reasons": []}
     if derivatives is None:
         derivatives = {}
-    regime_name = regime.get("regime", "RANGE")
+    regime_name = regime.get("regime_name") or regime.get("regime", "RANGE")
+    btc_regime_name = (btc_regime or {}).get("regime_name") or (btc_regime or {}).get("regime", "RANGE")
 
     long_score = 0
     short_score = 0
@@ -398,7 +416,7 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     reasons_long = []
     reasons_short = []
 
-    # ── 技术指标 ──
+    # ── 指标计算（全部基于已收盘 K 线；price 为实时触发价）──
     rsi_15m = rsi(closes_15m, 14)
     macd_data = macd(closes_15m)
     atr_val = atr(klines_15m, 14)
@@ -412,14 +430,12 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     fib = fibonacci_levels(max(k["high"] for k in klines_15m[-48:]), min(k["low"] for k in klines_15m[-48:]))
     fib_near = find_nearest_fib(price, fib)
 
-    # ── 成交量 ──
+    # ── 成交量 / K线形态 ──
     vol_analysis = analyze_volume(klines_15m)
     vol_ratio = vol_analysis["ratio"]
-
-    # ── K线形态 ──
     patterns_15m = detect_candlestick_patterns(klines_15m)
 
-    # ── 价格 vs EMA ──
+    # ── 多周期趋势（仅作 Context，文档20节）──
     trend_info = score_trend(klines_15m, klines_5m, klines_1m)
     ema20_val = trend_info["ema20"]
     ema50_val = trend_info["ema50"]
@@ -427,54 +443,29 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     ema_bull = ema20_val > ema50_val > ema200_val
     ema_bear = ema20_val < ema50_val < ema200_val
 
-    # ── 24h涨跌幅 ──
+    # ── 24h 行情 ──
     change_24h = float(ticker.get("priceChangePercent", 0))
+    high_24h = float(ticker.get("highPrice", 0))
+    low_24h = float(ticker.get("lowPrice", 0))
+    range_24h = high_24h - low_24h
+    range_pct = ((price - low_24h) / range_24h * 100) if range_24h > 0 else 50.0
 
-    # ── RSI（V2.0: 超买超卖必须结合 Market Regime 解释，不再单独作为反转信号）──
-    rsi_reversal_ok = regime_name in ("RANGE", "CHAOS")
+    # ── RSI/MACD/EMA 降级为 Context（文档20节）──
+    rsi_context = "neutral"
     if rsi_15m < 30:
-        if rsi_reversal_ok or regime_name == "TREND_UP":
-            long_score += 10
-            reasons_long.append(f"RSI超卖+环境允许 ({rsi_15m:.1f})")
-            warnings.append(f"RSI超卖区 ({rsi_15m:.1f})，环境{regime_name}，反弹需结构确认")
-        else:
-            warnings.append(f"RSI超卖 ({rsi_15m:.1f}) 但处于{regime_name}，可能只是下跌加速，不做多")
+        rsi_context = "oversold"
     elif rsi_15m > 70:
-        if rsi_reversal_ok or regime_name == "TREND_DOWN":
-            short_score += 10
-            reasons_short.append(f"RSI超买+环境允许 ({rsi_15m:.1f})")
-            warnings.append(f"RSI超买区 ({rsi_15m:.1f})，环境{regime_name}，回调需结构确认")
-        else:
-            warnings.append(f"RSI超买 ({rsi_15m:.1f}) 但处于{regime_name}，可能只是上涨加速，不做空")
+        rsi_context = "overbought"
     elif rsi_15m < 40:
-        if regime_name in ("RANGE", "TREND_UP", "CHAOS"):
-            long_score += 6
-            reasons_long.append(f"RSI偏低 ({rsi_15m:.1f})")
+        rsi_context = "weak"
     elif rsi_15m > 60:
-        if regime_name in ("RANGE", "TREND_DOWN", "CHAOS"):
-            short_score += 6
-            reasons_short.append(f"RSI偏高 ({rsi_15m:.1f})")
+        rsi_context = "strong"
+    if rsi_context in ("oversold", "overbought"):
+        warnings.append(f"RSI{rsi_context} ({rsi_15m:.1f})，属环境context，需结构/确认条件配合")
+    macd_context = macd_data["hist_trend"]  # rising / falling / neutral
+    ema_context = "bull" if ema_bull else ("bear" if ema_bear else "mixed")
 
-    # ── EMA排列 ──
-    if ema_bull:
-        long_score += 12
-        reasons_long.append("EMA多头排列 (20>50>200)")
-    elif ema_bear:
-        short_score += 12
-        reasons_short.append("EMA空头排列 (20<50<200)")
-    else:
-        long_score -= 4
-        short_score -= 4
-
-    # ── 价格相对EMA20 ──
-    if trend_info["price_above_ema20"]:
-        long_score += 6
-        reasons_long.append("价格在EMA20上方运行")
-    else:
-        short_score += 6
-        reasons_short.append("价格在EMA20下方运行")
-
-    # ── 结构 ──
+    # ── 方向倾向评分（仅技术位置因子；非概率，仅供展示与 grade）──
     if struct_trend == "bullish":
         long_score += 10
         reasons_long.append("上涨结构 (HH+HL)")
@@ -488,19 +479,14 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         short_score += 4
         reasons_short.append("顶背离可能")
 
-    # ── 斐波那契 ──
-    if fib_near["nearest"]:
-        fib_name = fib_near["nearest"]
-        level_val = fib.get(fib_name, 0)
-        if fib_near["touch"]:
-            if price < ema20_val:
-                short_score += 6
-                reasons_short.append(f"回抽Fib {fib_name} 阻力位")
-            else:
-                long_score += 6
-                reasons_long.append(f"回踩Fib {fib_name} 支撑位")
+    if fib_near["nearest"] and fib_near["touch"]:
+        if price < ema20_val:
+            short_score += 6
+            reasons_short.append(f"回抽Fib {fib_near['nearest']} 阻力位")
+        else:
+            long_score += 6
+            reasons_long.append(f"回踩Fib {fib_near['nearest']} 支撑位")
 
-    # ── K线形态 ──
     if patterns_15m.get("bullish_engulfing") or patterns_15m.get("pin_bar_bullish_c3"):
         long_score += 6
         reasons_long.append("下影Pin Bar (看涨)")
@@ -514,110 +500,56 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         short_score += 6
         reasons_short.append("假突破阻力后回落")
 
-    # ── ATR波动率 ──
-    if atr_pct > 5:
-        warnings.append(f"高波动 (ATR={atr_pct:.1f}%)，止损需放宽")
-    elif atr_pct < 1:
-        warnings.append(f"低波动 (ATR={atr_pct:.1f}%)，注意突破")
-
-    # ── 24h区间百分位 ──
-    high_24h = float(ticker.get("highPrice", 0))
-    low_24h = float(ticker.get("lowPrice", 0))
-    range_24h = high_24h - low_24h
-    range_pct = ((price - low_24h) / range_24h * 100) if range_24h > 0 else 50.0
-
     if range_pct <= 30:
         if struct_trend in ("bullish", "neutral"):
             long_score += 12
-            reasons_long.append(f"价格在24h区间低位 ({range_pct:.0f}%), 回调较充分")
+            reasons_long.append(f"价格在24h区间低位 ({range_pct:.0f}%)")
         else:
             short_score += 8
             reasons_short.append(f"区间低位({range_pct:.0f}%, 趋势偏空) 可能是下跌中继")
     elif range_pct > 85:
         if struct_trend in ("bearish", "neutral"):
             short_score += 15
-            reasons_short.append(f"价格在24h区间极高位 ({range_pct:.0f}%), 追高风险极大")
+            reasons_short.append(f"价格在24h区间极高位 ({range_pct:.0f}%)")
         else:
             long_score -= 12
             warnings.append(f"区间极高位({range_pct:.0f}%), 等回调再入场")
     elif range_pct > 70:
         if struct_trend in ("bearish", "neutral"):
             short_score += 10
-            reasons_short.append(f"价格在24h区间高位 ({range_pct:.0f}%), 反抽阻力")
+            reasons_short.append(f"价格在24h区间高位 ({range_pct:.0f}%)")
         else:
             long_score -= 6
             short_score += 4
             reasons_short.append(f"24h区间高位 ({range_pct:.0f}%), 入场偏后")
-            warnings.append(f"区间高位({range_pct:.0f}%), 等回调盈亏比更好")
 
-    # ── 入场盈亏比 ──
-    rr_long = None
     s = sr.get("support")
     r = sr.get("resistance")
     sd = sr.get("sup_dist_pct")
     rd = sr.get("res_dist_pct")
-
-    if s is not None and r is not None and sd is not None and rd is not None:
-        rr_long = rd / sd if sd > 0 else 0
-        rr_short = sd / rd if rd > 0 else 0
+    rr_long = rr_short = None
+    if s is not None and r is not None and sd is not None and rd is not None and sd > 0 and rd > 0:
+        rr_long = rd / sd
+        rr_short = sd / rd
         if rr_long >= 2.0:
             long_score += 8
             reasons_long.append(f"入场盈亏比有利 (1:{rr_long:.1f})")
         elif rr_long < 1.0:
             short_score += 6
-            reasons_short.append(f"做多盈亏比差 (1:{rr_long:.1f}), 上行空间不足")
+            reasons_short.append(f"做多盈亏比差 (1:{rr_long:.1f})")
         if rr_short >= 2.0:
             short_score += 8
             reasons_short.append(f"做空盈亏比有利 (1:{rr_short:.1f})")
         elif rr_short < 1.0:
             long_score += 6
-            reasons_long.append(f"做空盈亏比差 (1:{rr_short:.1f}), 下行空间不足")
+            reasons_long.append(f"做空盈亏比差 (1:{rr_short:.1f})")
     elif s is not None and sd is not None and sd < 1.5:
         long_score += 6
-        reasons_long.append(f"支撑位很近 (-{sd:.1f}%), 下行空间有限")
+        reasons_long.append(f"支撑位很近 (-{sd:.1f}%)")
     elif r is not None and rd is not None and rd < 1.5:
         short_score += 6
-        reasons_short.append(f"阻力位很近 (+{rd:.1f}%), 上行空间有限")
+        reasons_short.append(f"阻力位很近 (+{rd:.1f}%)")
 
-    # 备选：24h高/低
-    sup_dist_pct_24h = None
-    res_dist_pct_24h = None
-    if r is None and high_24h > price:
-        res_dist_pct_24h = (high_24h - price) / price * 100
-    if s is None and low_24h > 0:
-        sup_dist_pct_24h = (price - low_24h) / price * 100 if price > low_24h else 0
-        if sup_dist_pct_24h < 3:
-            long_score += 6
-            reasons_long.append(f"靠近24h低点 ({sup_dist_pct_24h:.1f}%), 短期支撑")
-
-    # 实际入场质量检查
-    if high_24h > price:
-        up_to_24h_high = (high_24h - price) / price * 100
-        if s is not None and sd is not None:
-            down_ref = sd
-        else:
-            down_ref = sup_dist_pct_24h if sup_dist_pct_24h is not None else (price - low_24h) / price * 100 if low_24h > 0 else 5.0
-        if down_ref > 0:
-            practical_rr = up_to_24h_high / down_ref
-            if practical_rr >= 2.0:
-                long_score += 8
-                reasons_long.append(f"入场盈亏比有利 (到24h高: +{up_to_24h_high:.1f}% / 到支撑: -{down_ref:.1f}%)")
-            elif practical_rr < 1.0 and long_score > short_score:
-                long_score -= 10
-                short_score += 8
-                reasons_short.append(f"做多盈亏比差 (实际1:{practical_rr:.1f}), 上行空间不足")
-                warnings.append(f"实际盈亏比差 (1:{practical_rr:.1f}), 入场不划算")
-
-    if sup_dist_pct_24h is not None and sup_dist_pct_24h > 0 and res_dist_pct_24h is not None:
-        rr_from_24h = res_dist_pct_24h / sup_dist_pct_24h
-        if rr_from_24h >= 2.0:
-            long_score += 4
-            reasons_long.append(f"24h区间盈亏比有利 (1:{rr_from_24h:.1f})")
-        elif rr_from_24h < 1.0:
-            short_score += 4
-            reasons_short.append(f"24h区间盈亏比差 (1:{rr_from_24h:.1f}), 上行空间不足")
-
-    # ── 成交量 ──
     if vol_analysis["signal"] == "volume_spike":
         if patterns_15m.get("bullish_engulfing") or patterns_15m.get("pin_bar_bullish_c3"):
             long_score += 8
@@ -627,282 +559,119 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
             reasons_short.append(f"放量配合 (x{vol_ratio:.1f})")
         else:
             warnings.append(f"异常放量 (x{vol_ratio:.1f})，注意变盘")
-    elif vol_analysis["signal"] == "volume_shrink":
-        if vol_ratio < 0.4:
-            if long_score > short_score and struct_trend == "bullish":
-                long_score -= 8
-                reasons_long.append(f"极度缩量上涨 (x{vol_ratio:.1f}), 动能不足")
-                warnings.append("极度缩量上涨，警惕虚假突破")
-            elif short_score > long_score and struct_trend == "bearish":
-                short_score -= 8
-                reasons_short.append(f"极度缩量下跌 (x{vol_ratio:.1f}), 抛压不足")
-        else:
-            if long_score > short_score:
-                warnings.append("缩量回调，可能是良性调整")
-            elif short_score > long_score:
-                warnings.append("缩量反弹，力度存疑")
 
-    # ── 资金费率 ──
-    if funding["signal"] == "long_crowded":
-        short_score += 8
-        reasons_short.append(f"多头拥挤 (资金费率{funding['funding_rate']:+.6f})")
-        warnings.append("资金费率偏高，多头拥挤，主力可能砸盘")
-    elif funding["signal"] == "short_crowded":
-        long_score += 8
-        reasons_long.append(f"空头拥挤 (资金费率{funding['funding_rate']:+.6f})")
-        warnings.append("资金费率偏低，空头拥挤，小心轧空")
-
-    # ── Whale Score (巨鲸评分) ──────────────────────────────────────
-    # 文档: FinalScore = Technical×0.50 + FundRate×0.15 + OI×0.15 + Whale×0.20
-    # 集成方式: Whale Score 作为方向一致性因子，最大影响 ±12 分（相当于20%权重）
-    ws = 50.0
-    whale_result = {"grade_label": "中性 ➖", "confidence": 0.0}
-    try:
-        if whale_override is not None:
-            # 回测模式：whale 因子中性化（实时 orderbook 无法回测）
-            whale_result = whale_override
-        else:
-            whale_result = calc_whale_score(symbol)
-        ws = whale_result["whale_score"]
-        wc = whale_result["confidence"]
-        whale_impact = (ws - 50) / 50 * 12  # -12 ~ +12
-        if wc < 0.4:
-            whale_impact *= 0.5
-        reason_tag = f"🐋 巨鲸WS={ws:.0f}"
-        if whale_impact > 3:
-            long_score += whale_impact
-            reasons_long.append(reason_tag)
-            if ws >= 70:
-                long_score += 4
-                reasons_long.append(f"🐋 巨鲸强烈看多")
-        elif whale_impact < -3:
-            short_score += abs(whale_impact)
-            reasons_short.append(reason_tag)
-            if ws <= 30:
-                short_score += 4
-                reasons_short.append(f"🐋 巨鲸强烈看空")
-    except Exception:
-        pass  # Whale Score 失败不中断主流程
-
-    # ── 衍生品因子 (V2.0: OI / Taker / Funding 趋势) ────────────────
-    if derivatives:
-        price_up_15m = trend_info["trend_15m"] == "bull"
-        oi_trend = derivatives.get("oi_trend")
-        if oi_trend == "rising":
-            if price_up_15m:
-                long_score += 8
-                reasons_long.append(f"OI上升+价格上涨 (新多进场, 15m OI {derivatives.get('oi_change_15m', 0):+.1f}%)")
-            else:
-                short_score += 8
-                reasons_short.append(f"OI上升+价格下跌 (新空进场, 15m OI {derivatives.get('oi_change_15m', 0):+.1f}%)")
-        elif oi_trend == "falling":
-            if price_up_15m:
-                short_score += 4
-                reasons_short.append("OI下降+价格上涨 (空头平仓推动, 持续性存疑)")
-                warnings.append("OI下降+价格上涨，注意可能只是空头回补")
-            else:
-                short_score += 6
-                reasons_short.append("OI下降+价格下跌 (多头离场/踩踏)")
-
-        taker_trend = derivatives.get("taker_trend")
-        if taker_trend == "buy_dominant":
-            long_score += 6
-            reasons_long.append("Taker主动买盘主导")
-        elif taker_trend == "sell_dominant":
-            short_score += 6
-            reasons_short.append("Taker主动卖盘主导")
-
-        funding_regime = derivatives.get("funding_regime")
-        funding_rate_now = derivatives.get("funding_rate")
-        fr_str = f"{funding_rate_now:+.5f}" if funding_rate_now is not None else "?"
-        if funding_regime == "extreme_long":
-            short_score += 8
-            reasons_short.append(f"极端多头拥挤 (funding {fr_str})")
-            warnings.append("资金费率极端偏高，多头杠杆过热")
-        elif funding_regime == "long_crowded":
-            short_score += 5
-            reasons_short.append(f"多头拥挤 (funding {fr_str})")
-        elif funding_regime == "extreme_short":
-            long_score += 8
-            reasons_long.append(f"极端空头拥挤 (funding {fr_str})")
-            warnings.append("资金费率极端偏低，空头杠杆过热")
-        elif funding_regime == "short_crowded":
-            long_score += 5
-            reasons_long.append(f"空头拥挤 (funding {fr_str})")
-
-        if derivatives.get("funding_trend") == "rising" and (funding_rate_now or 0) > 0:
-            short_score += 3
-            reasons_short.append("Funding持续上升 (多头杠杆加速)")
-        elif derivatives.get("funding_trend") == "falling" and (funding_rate_now or 0) < 0:
-            long_score += 3
-            reasons_long.append("Funding持续下降 (空头杠杆加速)")
-
-    # ── 24h涨跌幅（V2.0: 大跌≠做多/大涨≠做空，必须结合 Market Regime）──
-    if change_24h > 15:
-        if regime_name in ("RANGE", "TREND_UP"):
-            short_score += 10
-            reasons_short.append(f"24h涨幅过大+环境允许 ({change_24h:+.1f}%)")
-            warnings.append("24h涨幅超过15%，追高风险极大")
-        else:
-            warnings.append(f"24h涨幅过大 ({change_24h:+.1f}%) 但处于{regime_name}，等待反转结构确认")
-    elif change_24h < -15:
-        if regime_name == "RANGE":
-            long_score += 10
-            reasons_long.append(f"24h跌幅过大+震荡环境 ({change_24h:+.1f}%)")
-            warnings.append("24h跌幅超过15%，仅震荡环境可博反弹")
-        else:
-            warnings.append(f"24h跌幅过大 ({change_24h:+.1f}%) 但处于{regime_name}，不接飞刀")
-    elif 5 <= change_24h <= 15:
-        if regime_name in ("RANGE", "TREND_UP", "CHAOS"):
-            short_score += 5
-            reasons_short.append(f"24h涨幅适中 ({change_24h:+.1f}%)")
-    elif -15 <= change_24h <= -5:
-        if regime_name == "RANGE":
-            long_score += 5
-            reasons_long.append(f"24h跌幅适中 ({change_24h:+.1f}%)")
-
-    # ── MACD ──
-    if macd_data["hist_trend"] == "rising":
-        long_score += 8
-        reasons_long.append("MACD柱状图上升")
-    elif macd_data["hist_trend"] == "falling":
-        short_score += 8
-        reasons_short.append("MACD柱状图下降")
-
-    # ── MACD背离 ──
-    if len(closes_15m) >= 60 and len(macd_data["macd_line_series"]) >= 5:
-        recent_macd = macd_data["macd_line_series"]
-        price_5ago = closes_15m[-5]
-        price_now = closes_15m[-1]
-        macd_5ago = recent_macd[0]
-        macd_now = recent_macd[-1]
-        if price_now > price_5ago * 1.005 and macd_now < macd_5ago * 0.995:
-            short_score += 10
-            reasons_short.append("MACD顶背离")
-            warnings.append("MACD顶背离，上涨动能衰减")
-        if price_now < price_5ago * 0.995 and macd_now > macd_5ago * 1.005:
-            long_score += 10
-            reasons_long.append("MACD底背离")
-            warnings.append("MACD底背离，下跌动能衰减")
-
-    # ── 多周期共振 ──
-    if trend_info["tf_aligned"]:
-        if trend_info["tf_dominant"] == "bull":
-            long_score += 12
-            reasons_long.append("多周期看多共振 (15m/5m/1m)")
-        else:
-            short_score += 12
-            reasons_short.append("多周期看空共振 (15m/5m/1m)")
-    else:
-        if trend_info["trend_15m"] == trend_info["trend_5m"]:
-            if trend_info["trend_15m"] == "bull":
-                long_score += 6
-                reasons_long.append("15m+5m看多")
-            else:
-                short_score += 6
-                reasons_short.append("15m+5m看空")
-
-    # ── ATR波动率 ──
     if atr_pct > 5:
         warnings.append(f"高波动 (ATR={atr_pct:.1f}%)，止损需放宽")
     elif atr_pct < 1:
         warnings.append(f"低波动 (ATR={atr_pct:.1f}%)，注意突破")
 
-    # ── 冲突衰减 ──
-    decay = 0
-    long_conf_reasons = [r for r in reasons_long if "看多" in r or "共振" in r or "多头" in r]
-    short_conf_reasons = [r for r in reasons_short if "看空" in r or "共振" in r or "空头" in r]
-    if long_conf_reasons and short_conf_reasons:
-        decay += CONFLICT_DECAY_WEAK
-        long_score -= CONFLICT_DECAY_WEAK // 2
-        short_score -= CONFLICT_DECAY_WEAK // 2
-        if trend_info["tf_aligned"]:
-            pass
-        else:
-            decay += CONFLICT_DECAY_STRONG
-            long_score -= CONFLICT_DECAY_STRONG // 2
-            short_score -= CONFLICT_DECAY_STRONG // 2
-    if struct_trend == "neutral":
-        decay += STRUCTURE_NEUTRAL_DECAY
-        long_score -= STRUCTURE_NEUTRAL_DECAY // 2
-        short_score -= STRUCTURE_NEUTRAL_DECAY // 2
-    if atr_pct > 5:
-        decay += VOLATILITY_DECAY
-        long_score -= VOLATILITY_DECAY // 2
-        short_score -= VOLATILITY_DECAY // 2
+    # ── 衍生品因子 = 市场状态 / 确认条件（文档16/17节，不再机械加减分）──
+    oi_trend = derivatives.get("oi_trend", "unknown")
+    oi_chg_15m = derivatives.get("oi_change_15m")
+    oi_participation = oi_chg_15m is not None and abs(oi_chg_15m) >= 1.0
+    taker_trend = derivatives.get("taker_trend", "neutral")
+    funding_regime = derivatives.get("funding_regime", "normal")
+    funding_trend = derivatives.get("funding_trend", "flat")
+    funding_acc = derivatives.get("funding_acceleration", 0.0)
+    funding_rate_now = derivatives.get("funding_rate")
+    liq_5m_long = derivatives.get("liq_5m_long")
+    liq_5m_short = derivatives.get("liq_5m_short")
 
-    # ── V2.0 硬过滤层 (Market Regime + BTC 大盘环境) ──
-    no_trade = False
-    no_trade_reason = ""
-    btc_regime_name = (btc_regime or {}).get("regime", "RANGE")
-    if long_score >= short_score:
-        if regime_name in ("TREND_DOWN", "BREAKDOWN"):
-            no_trade = True
-            no_trade_reason = f"标的处于 {regime_name}，禁止逆势做多"
-        elif btc_regime_name in ("TREND_DOWN", "BREAKDOWN"):
-            no_trade = True
-            no_trade_reason = f"BTC 大盘处于 {btc_regime_name}，禁止做多"
-        elif regime.get("trend_4h") == "DOWN" and regime.get("trend_1h") == "DOWN":
-            no_trade = True
-            no_trade_reason = "4H/1H 双空头趋势，禁止做多"
+    # ── V2.1 Strategy 层（文档21节）──
+    strat_ctx = {
+        "struct_trend": struct_trend,
+        "patterns": patterns_15m,
+        "sup_dist_pct": sd,
+        "res_dist_pct": rd,
+        "fib_nearest": fib_near["nearest"],
+        "fib_touch": fib_near["touch"],
+        "price": price,
+        "ema20": ema20_val,
+        "high_volatility": regime.get("high_volatility", False),
+        "range_pct": range_pct,
+    }
+    strat = detect_strategy(regime_name, strat_ctx)
+    strategy = strat["strategy"]
+    setup = strat["setup"]
+    candidate_direction = strat["candidate_direction"]
+    counter_trend = strat["counter_trend"]
+    reason_codes = list(strat["reason_codes"])
+
+    # ── V2.1 必要条件（文档8.1节：全部必须满足）──
+    sup_ref = sd if sd is not None else ((price - low_24h) / price * 100 if low_24h > 0 and price > low_24h else None)
+    res_ref = rd if rd is not None else ((high_24h - price) / price * 100 if high_24h > price else None)
+    needs = {"setup_valid": False, "entry_zone": False, "structure_5m": False, "rr_pass": False}
+    if strategy != STRATEGY_NONE and candidate_direction in ("LONG", "SHORT"):
+        needs["setup_valid"] = True
+        if candidate_direction == "LONG":
+            needs["entry_zone"] = (sup_ref is not None and sup_ref <= 2.0) or (fib_near["nearest"] and fib_near["touch"] and price <= ema20_val)
+            needs["structure_5m"] = trend_info["trend_5m"] == "bull"
+            rr_cur = rr_long
+        else:
+            needs["entry_zone"] = (res_ref is not None and res_ref <= 2.0) or (fib_near["nearest"] and fib_near["touch"] and price >= ema20_val)
+            needs["structure_5m"] = trend_info["trend_5m"] == "bear"
+            rr_cur = rr_short
+        needs["rr_pass"] = rr_cur is not None and rr_cur >= 1.2  # 最低盈亏比要求（文档8.1）
+
+    # ── V2.1 确认条件（文档8.2节：确认因素，非独立计票；缺数据跳过）──
+    confirms = []
+    if candidate_direction == "LONG":
+        vol_ok = vol_ratio >= 1.2 or (vol_analysis["signal"] == "volume_spike" and (patterns_15m.get("bullish_engulfing") or patterns_15m.get("pin_bar_bullish_c3")))
+        if vol_ok:
+            confirms.append("VOLUME_CONFIRM")
+        if oi_participation:
+            confirms.append("OI_PARTICIPATION")
+        if taker_trend == "buy_dominant":
+            confirms.append("TAKER_SUPPORT")
+        if funding_regime in ("normal", "short_crowded", "extreme_short"):
+            confirms.append("FUNDING_OK")
+    elif candidate_direction == "SHORT":
+        vol_ok = vol_ratio >= 1.2 or (vol_analysis["signal"] == "volume_spike" and (patterns_15m.get("bearish_engulfing") or patterns_15m.get("pin_bar_bearish_c3")))
+        if vol_ok:
+            confirms.append("VOLUME_CONFIRM")
+        if oi_participation:
+            confirms.append("OI_PARTICIPATION")
+        if taker_trend == "sell_dominant":
+            confirms.append("TAKER_SUPPORT")
+        if funding_regime in ("normal", "long_crowded", "extreme_long"):
+            confirms.append("FUNDING_OK")
+
+    # 确认门槛：顺势2 / 逆势+1 / 高波动+1（文档8.2/19节）
+    need_confirm = required_confirm_count(counter_trend, regime.get("high_volatility", False))
+
+    # ── V2.1 状态机判定（文档25节）──
+    if strategy == STRATEGY_NONE:
+        signal_status = "NO_TRADE"
+        no_trade = True
+        no_trade_reason = strat.get("block_reason") or "无匹配策略/位置条件"
+    elif not all(needs.values()):
+        signal_status = "WAIT"
+        no_trade = False
+        no_trade_reason = ""
+    elif len(confirms) < need_confirm:
+        signal_status = "WAIT"
+        no_trade = False
+        no_trade_reason = ""
     else:
-        if regime_name in ("TREND_UP", "BREAKOUT"):
-            no_trade = True
-            no_trade_reason = f"标的处于 {regime_name}，禁止逆势做空"
-        elif btc_regime_name in ("TREND_UP", "BREAKOUT"):
-            no_trade = True
-            no_trade_reason = f"BTC 大盘处于 {btc_regime_name}，禁止做空"
-        elif regime.get("trend_4h") == "UP" and regime.get("trend_1h") == "UP":
-            no_trade = True
-            no_trade_reason = "4H/1H 双多头趋势，禁止做空"
+        signal_status = "READY"
+        no_trade = False
+        no_trade_reason = ""
 
-    # ── V2.0 Entry Trigger（入场触发器：位置+结构+量能确认，文档14/15/16节）──
-    entry_trigger = "WAIT"
-    trigger_met = []
-    trigger_missing = []
-    if not no_trade:
-        # 盈亏比（rr_short 可能未定义，重新计算）
-        rr_short_val = (sd / rd) if (sd is not None and rd is not None and rd > 0) else None
-        sup_ref = sd if sd is not None else sup_dist_pct_24h
-        res_ref = rd if rd is not None else res_dist_pct_24h
-        vol_ok = vol_ratio >= 1.2 or vol_analysis["signal"] == "volume_spike"
-        direction_now = "LONG" if long_score >= short_score else "SHORT"
-        if direction_now == "LONG":
-            checks = [
-                ("关键位置(贴近支撑/Fib回踩)",
-                 (sup_ref is not None and sup_ref <= 1.5) or
-                 (fib_near["nearest"] and fib_near["touch"] and price <= ema20_val)),
-                ("5M结构转多", trend_info["trend_5m"] == "bull"),
-                ("成交量确认", vol_ok),
-                ("流动性扫盘/假跌破", bool(patterns_15m.get("fake_break_below"))),
-                ("OI配合(新多进场)", derivatives.get("oi_trend") == "rising"),
-                ("Funding未过热", derivatives.get("funding_regime") not in ("extreme_long",)),
-                ("盈亏比≥1:2", rr_long is not None and rr_long >= 2.0),
-                ("环境允许", regime_name in ("RANGE", "TREND_UP", "CHAOS")),
-            ]
-        else:
-            checks = [
-                ("关键位置(贴近阻力/Fib回抽)",
-                 (res_ref is not None and res_ref <= 1.5) or
-                 (fib_near["nearest"] and fib_near["touch"] and price >= ema20_val)),
-                ("5M结构转空", trend_info["trend_5m"] == "bear"),
-                ("成交量确认", vol_ok),
-                ("流动性扫盘/假突破", bool(patterns_15m.get("fake_break_above"))),
-                ("OI配合(新空进场)", derivatives.get("oi_trend") == "rising"),
-                ("Funding未过热", derivatives.get("funding_regime") not in ("extreme_short",)),
-                ("盈亏比≥1:2", rr_short_val is not None and rr_short_val >= 2.0),
-                ("环境允许", regime_name in ("RANGE", "TREND_DOWN", "CHAOS")),
-            ]
-        for name, ok in checks:
-            (trigger_met if ok else trigger_missing).append(name)
-        core_ok = sum(1 for m in trigger_met
-                      if m.startswith("关键位置") or m.startswith("5M结构") or m.startswith("成交量"))
-        if len(trigger_met) >= 5 and core_ok >= 2:
-            entry_trigger = "READY"
+    # P0-1/P0-3: trade_direction 仅 READY 才有方向
+    trade_direction = candidate_direction if signal_status == "READY" else "NEUTRAL"
 
-    signal_status = "NO_TRADE" if no_trade else entry_trigger
+    missing = [k for k, ok in needs.items() if not ok]
+    trigger_met = [f"必要:{k}" for k, ok in needs.items() if ok] + [f"确认:{c}" for c in confirms]
+    trigger_missing = [f"必要:{k}" for k in missing]
+    if not missing and len(confirms) < need_confirm:
+        trigger_missing.append(f"确认不足({len(confirms)}/{need_confirm})")
+    if signal_status == "READY":
+        for k, ok in needs.items():
+            if ok:
+                reason_codes.append(f"NEED_{k.upper()}_OK")
+        reason_codes += [f"CONFIRM_{c}" for c in confirms]
 
-    # 最近结构低点/高点（V2.0 结构止损依据，取 entry 同侧最近的摆动点）
+    # 最近结构低点/高点（V2.0 结构止损依据）
     swing_low_recent = None
     swing_high_recent = None
     for sl_ in reversed(swing.get("swing_lows", [])):
@@ -914,15 +683,16 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
             swing_high_recent = sh_[1]
             break
 
-    # ── 计算概率 ──
+    # ── 伪概率（score-implied，非统计概率；文档5节）──
     max_possible = 100
     net_score = long_score - short_score
     long_prob_raw = 50.0 + (net_score / max_possible) * 50.0
     long_prob = round(max(5, min(95, long_prob_raw)), 1)
     short_prob = round(100 - long_prob, 1)
+    score_confidence = max(long_prob, short_prob)
 
-    # ── 信号等级 ──
-    signal_strength = max(long_prob, short_prob)
+    # 信号等级（仅表示评分强度，不代表交易建议）
+    signal_strength = score_confidence
     dominant_score = max(long_score, short_score)
     if signal_strength >= 72 and trend_info["tf_aligned"] and dominant_score >= 30:
         grade = "A"
@@ -935,15 +705,16 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
     if no_trade:
         grade = "N"
 
-    # 空判断用于显示
-    long_str = "LONG" if long_prob >= 50 else "SHORT"
-    tf_tag = "✅" if trend_info["tf_aligned"] else "❌"
+    long_str = candidate_direction if candidate_direction in ("LONG", "SHORT") else ("LONG" if long_prob >= 50 else "SHORT")
 
     return {
         "long_probability": long_prob,
         "short_probability": short_prob,
+        "probability_note": "score_implied，非统计胜率（V2.1）",
         "long_score": round(long_score),
         "short_score": round(short_score),
+        "direction_score": round(net_score),
+        "score_confidence": round(score_confidence, 1),
         "grade": grade,
         "direction_hint": long_str,
         "rsi": round(rsi_15m, 1),
@@ -968,13 +739,10 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "warnings": warnings[:4],
         "tf_aligned": trend_info["tf_aligned"],
         "change_24h": round(change_24h, 2),
-        "whale_score": round(ws, 1) if ws else 50.0,
-        "whale_grade_label": whale_result.get("grade_label", "中性 ➖") if ws else "中性 ➖",
-        "whale_factors": {
-            fname: {"score": f["score"], "detail": f["detail"][:40]}
-            for fname, f in whale_result.get("factors", {}).items()
-        } if ws else {},
-        # ── V2.0 新增 ──
+        "whale_score": 50.0,
+        "whale_grade_label": "中性 ➖",
+        "whale_factors": {},
+        # ── V2.0 兼容 ──
         "market_regime": regime_name,
         "trend_4h": regime.get("trend_4h", "FLAT"),
         "trend_1h": regime.get("trend_1h", "FLAT"),
@@ -982,7 +750,7 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "btc_regime": btc_regime_name,
         "no_trade": no_trade,
         "no_trade_reason": no_trade_reason,
-        "entry_trigger": entry_trigger,
+        "entry_trigger": signal_status,
         "signal_status": signal_status,
         "trigger_met": trigger_met,
         "trigger_missing": trigger_missing,
@@ -993,14 +761,33 @@ def score_system(price: float, klines_15m: list[dict], klines_5m: list[dict], kl
         "oi_change_5m": derivatives.get("oi_change_5m"),
         "oi_change_15m": derivatives.get("oi_change_15m"),
         "oi_change_1h": derivatives.get("oi_change_1h"),
-        "oi_trend": derivatives.get("oi_trend"),
-        "funding_trend": derivatives.get("funding_trend"),
-        "funding_regime": derivatives.get("funding_regime"),
+        "oi_trend": oi_trend,
+        "funding_trend": funding_trend,
+        "funding_regime": funding_regime,
         "taker_ratio": derivatives.get("taker_ratio"),
-        "taker_trend": derivatives.get("taker_trend"),
+        "taker_trend": taker_trend,
         "global_ls_ratio": derivatives.get("global_ls_ratio"),
-        "liq_5m_long": derivatives.get("liq_5m_long"),
-        "liq_5m_short": derivatives.get("liq_5m_short"),
+        "liq_5m_long": liq_5m_long,
+        "liq_5m_short": liq_5m_short,
+        # ── V2.1 新增 ──
+        "strategy": strategy,
+        "setup": setup,
+        "candidate_direction": candidate_direction,
+        "trade_direction": trade_direction,
+        "counter_trend": counter_trend,
+        "reason_codes": reason_codes,
+        "context": {
+            "rsi": rsi_context,
+            "macd_hist": macd_context,
+            "ema": ema_context,
+            "vol_ratio": round(vol_ratio, 1),
+            "change_24h": round(change_24h, 2),
+            "funding_acceleration": funding_acc,
+        },
+        "regime_strength": regime.get("regime_strength", 0.0),
+        "volatility_state": regime.get("volatility_state", "UNKNOWN"),
+        "need_confirm": need_confirm,
+        "confirm_count": len(confirms),
     }
 
 
@@ -1017,6 +804,15 @@ def format_gui_details(d: dict) -> str:
     trend_1h = d.get("trend_1h", "—")
     btc_regime = d.get("btc_regime", "—")
     parts.append(f"🌍 市场环境: {regime}  (4H:{trend_4h} / 1H:{trend_1h} | BTC:{btc_regime})")
+    # ── V2.1 策略层 ──
+    strat = d.get("strategy", "NONE")
+    setup = d.get("setup", "NONE")
+    cand = d.get("candidate_direction", "NEUTRAL")
+    if strat != "NONE":
+        ct_tag = "⚠️逆势" if d.get("counter_trend") else "顺势"
+        parts.append(f"   🎯 策略: {strat} ({setup})  候选方向: {cand} [{ct_tag}]")
+    else:
+        parts.append(f"   🎯 策略: 无匹配假设（不交易）")
     oi_chg = d.get("oi_change_15m")
     if oi_chg is not None:
         parts.append(f"   OI 15m: {oi_chg:+.1f}% ({d.get('oi_trend','—')})  |  Taker: {d.get('taker_trend','—')}  |  Funding: {d.get('funding_regime','—')} 趋势{d.get('funding_trend','—')}")
@@ -1107,40 +903,44 @@ def format_gui_details(d: dict) -> str:
 
 
 def risk_recommendation(price: float, score_result: dict, account_balance: float = 1000.0) -> dict:
+    """
+    V2.1: 仅 READY 信号生成交易参数（文档第3/4节）。
+
+    - WAIT / NO_TRADE → direction=NEUTRAL，entry/SL/TP 全 None，position_size=0
+    - READY → 结构止损 + 动态 TP（保留 V2.0 已验证组件）
+    - Whale Score 不再参与仓位/杠杆修正（文档原则6）
+    """
+    neutral = {
+        "direction": "NEUTRAL",
+        "confidence": score_result.get("score_confidence", 0),
+        "entry_price": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "sl_pct": None,
+        "tp_pct": None,
+        "rr_ratio": None,
+        "tp2_price": None,
+        "sl_basis": None,
+        "leverage": 0,
+        "position_pct": 0,
+        "notional_value": 0,
+        "risk_amount": 0,
+    }
+
+    # P0-1: WAIT 不得产生交易方向 / 参数
+    if score_result.get("signal_status") != "READY":
+        return neutral
+    direction = score_result.get("trade_direction", "NEUTRAL")
+    if direction not in ("LONG", "SHORT"):
+        return neutral
+
     atr_pct = score_result["atr_pct"]
-    long_prob = score_result["long_probability"]
-    short_prob = score_result["short_probability"]
+    score_confidence = score_result.get("score_confidence") or max(
+        score_result.get("long_probability", 50), score_result.get("short_probability", 50))
 
-    if long_prob > short_prob and long_prob >= 60:
-        direction = "LONG"
-        confidence = long_prob
-    elif short_prob > long_prob and short_prob >= 60:
-        direction = "SHORT"
-        confidence = short_prob
-    else:
-        direction = "NEUTRAL"
-        confidence = max(long_prob, short_prob)
-
-    # ── Whale Score 方向一致性检查 ──
-    # 巨鲸方向和技术方向一致 → 加分；不一致 → 扣减仓位
-    ws = score_result.get("whale_score", 50.0)
-    ws_bullish = ws > 60
-    ws_bearish = ws < 40
-    whale_penalty = 1.0  # 1.0 = 不影响
-    if direction == "LONG" and ws_bearish:
-        whale_penalty = 0.5  # 技术看多但巨鲸看空 → 仓位减半
-    elif direction == "SHORT" and ws_bullish:
-        whale_penalty = 0.5
-    elif direction == "LONG" and ws_bullish:
-        whale_penalty = 1.2  # 双方向一致 → 增加信心
-    elif direction == "SHORT" and ws_bearish:
-        whale_penalty = 1.2
-
-    # ── V2.0 结构止损 + 动态 TP（文档17节）──
-    # SL = 结构位(留缓冲) 与 ATR 保护的组合：至少 ATR×1，至多 ATR×3
+    # ── V2.0 结构止损 + 动态 TP（文档27节）──
+    # SL = 结构位(留0.1%缓冲) 与 ATR 保护组合：至少 ATR×1，至多 ATR×3
     # TP1 = 最近结构阻力/支撑，TP2 = 24h 极值（下一流动性目标）
-    # 不再固定 TP = SL × 2
-    score_confidence = max(long_prob, short_prob)
     if score_confidence >= 75:
         conf_mult = 0.9
     elif score_confidence >= 65:
@@ -1161,7 +961,6 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
         sl_pct = min(sl_pct, atr_pct * 3.0)
         sl_pct = max(sl_pct, 0.5) * conf_mult
         stop_loss = price * (1 - sl_pct / 100)
-        # 动态 TP：TP1 = 最近阻力；TP2 = 24h 高（下一流动性目标）
         tp1_price = score_result.get("resistance")
         if tp1_price and tp1_price > price:
             tp1_pct = (tp1_price - price) / price * 100
@@ -1185,7 +984,6 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
         sl_pct = min(sl_pct, atr_pct * 3.0)
         sl_pct = max(sl_pct, 0.5) * conf_mult
         stop_loss = price * (1 + sl_pct / 100)
-        # 动态 TP：TP1 = 最近支撑；TP2 = 24h 低（下一流动性目标）
         tp1_price = score_result.get("support")
         if tp1_price and 0 < tp1_price < price:
             tp1_pct = (price - tp1_price) / price * 100
@@ -1206,7 +1004,6 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
     position_pct = position_size / account_balance * 100 if account_balance > 0 else 0
     if score_confidence < 75:
         position_pct *= 0.6
-    position_pct *= whale_penalty  # Whale Score 方向一致性修正
 
     if atr_pct < 1:
         leverage = 5
@@ -1218,7 +1015,6 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
         leverage = 1
     if score_confidence < 65:
         leverage = max(int(leverage * 0.5), 1)
-    leverage = max(1, round(leverage * whale_penalty))  # Whale Score 杠杆修正
 
     notional_value = position_size
     if notional_value > account_balance * 2:
@@ -1227,7 +1023,7 @@ def risk_recommendation(price: float, score_result: dict, account_balance: float
 
     return {
         "direction": direction,
-        "confidence": round(confidence, 1),
+        "confidence": round(score_confidence, 1),
         "entry_price": price,
         "stop_loss": round(stop_loss, 6) if price < 1000 else round(stop_loss, 2),
         "take_profit": round(take_profit, 6) if price < 1000 else round(take_profit, 2),
@@ -1346,13 +1142,17 @@ def format_output(symbol: str, score: dict, risk: dict, price: float, brief: boo
 
     dir_emoji = {"LONG": "🟢 做多", "SHORT": "🔴 做空", "NEUTRAL": "⚪ 观望"}
 
-    if risk["direction"] == "NEUTRAL" or risk["confidence"] < 60:
+    if risk["direction"] == "NEUTRAL":
         lines.append(f"  📋 操作建议  [{grade_tag}]")
         lines.append(f"  {'='*52}")
         if score.get("no_trade"):
             lines.append(f"     建议: 🚫 NO TRADE（{score.get('no_trade_reason','')}）")
+        elif score.get("signal_status") == "WAIT":
+            lines.append(f"     建议: ⏸ WAIT（候选 {score.get('candidate_direction','—')}，条件未满足）")
+            if score.get("trigger_missing"):
+                lines.append(f"     缺: {', '.join(score['trigger_missing'][:4])}")
         else:
-            lines.append(f"     建议: ⚪ 观望（信号不明确，信噪比过低）")
+            lines.append(f"     建议: ⚪ 观望（无 READY 信号）")
         lines.append(f"     置信度: {risk['confidence']}%")
         lines.append("")
         lines.append(f"     💡 等待以下条件改善后再入场：")
@@ -1404,8 +1204,8 @@ def analyze_coin(symbol: str, balance: float = 1000.0) -> str:
         ticker = fetch_ticker(sym)
         price = float(ticker["lastPrice"])
 
-        klines_15m = fetch_klines(sym, "15m", 200)
-        klines_5m = fetch_klines(sym, "5m", 100)
+        klines_15m = fetch_klines(sym, "15m", 200, closed_only=True)
+        klines_5m = fetch_klines(sym, "5m", 100, closed_only=True)
         klines_1m = fetch_klines(sym, "1m", 60, closed_only=True)
         klines_4h = fetch_klines(sym, "4h", 200, closed_only=True)
         klines_1h = fetch_klines(sym, "1h", 200, closed_only=True)
@@ -1452,8 +1252,8 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
         ticker = fetch_ticker(sym)
         price = float(ticker["lastPrice"])
 
-        klines_15m = fetch_klines(sym, "15m", 200)
-        klines_5m = fetch_klines(sym, "5m", 100)
+        klines_15m = fetch_klines(sym, "15m", 200, closed_only=True)
+        klines_5m = fetch_klines(sym, "5m", 100, closed_only=True)
         klines_1m = fetch_klines(sym, "1m", 60, closed_only=True)
         klines_4h = fetch_klines(sym, "4h", 200, closed_only=True)
         klines_1h = fetch_klines(sym, "1h", 200, closed_only=True)
@@ -1501,6 +1301,14 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
                 "funding_regime": score.get("funding_regime"),
                 "taker_trend": score.get("taker_trend"),
                 "entry_trigger": score.get("entry_trigger"),
+                "strategy": score.get("strategy"),
+                "setup": score.get("setup"),
+                "candidate_direction": score.get("candidate_direction"),
+                "trade_direction": score.get("trade_direction"),
+                "signal_status": score.get("signal_status"),
+                "reason_codes": score.get("reason_codes", []),
+                "regime_strength": score.get("regime_strength"),
+                "volatility_state": score.get("volatility_state"),
             })
             evaluate_pending()
         except Exception:
@@ -1582,6 +1390,20 @@ def analyze_coin_dict(symbol: str, balance: float = 1000.0) -> dict:
             "global_ls_ratio": score.get("global_ls_ratio"),
             "liq_5m_long": score.get("liq_5m_long"),
             "liq_5m_short": score.get("liq_5m_short"),
+            # ── V2.1 新增 ──
+            "strategy": score.get("strategy", "NONE"),
+            "setup": score.get("setup", "NONE"),
+            "candidate_direction": score.get("candidate_direction", "NEUTRAL"),
+            "trade_direction": score.get("trade_direction", "NEUTRAL"),
+            "counter_trend": score.get("counter_trend", False),
+            "reason_codes": score.get("reason_codes", []),
+            "regime_strength": score.get("regime_strength", 0.0),
+            "volatility_state": score.get("volatility_state", "UNKNOWN"),
+            "probability_note": score.get("probability_note", ""),
+            "direction_score": score.get("direction_score", 0),
+            "score_confidence": score.get("score_confidence", 0),
+            "need_confirm": score.get("need_confirm", 0),
+            "confirm_count": score.get("confirm_count", 0),
         }
 
     except Exception as e:

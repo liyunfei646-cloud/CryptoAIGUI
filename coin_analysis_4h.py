@@ -147,7 +147,10 @@ def structural_sl_tp(price: float, atr_pct: float, klines: list, swing_highs: li
 
 
 def compute_short_factors(klines, interval_minutes=240, symbol=None,
-                          funding_rate_override=None, oi_series_override=None):
+                          funding_rate_override=None, oi_series_override=None,
+                          derivatives_disabled=False):
+    """derivatives_disabled=True 时跳过资金费率/OI 两个衍生品因子（不计入分母），
+    用于长周期（>20天）纯技术面降级回测——OI 历史仅覆盖约 20.8 天。"""
     closes = [k["close"] for k in klines]
     price = closes[-1]
     n = len(klines)
@@ -276,7 +279,9 @@ def compute_short_factors(klines, interval_minutes=240, symbol=None,
         factors.append(("缩量上涨", False, f"量比{vol['ratio']:.1f}x {_vol_cn(vol['signal'])}，结构{_trend_cn(struct_trend)}"))
 
     # 11. 资金费率（聪明钱·多头拥挤度）
-    if symbol:
+    if derivatives_disabled:
+        factors.append(("资金费率多头拥挤", None, "降级模式(无衍生品历史)"))
+    elif symbol:
         try:
             if funding_rate_override is not None:
                 fr = float(funding_rate_override)
@@ -294,7 +299,9 @@ def compute_short_factors(klines, interval_minutes=240, symbol=None,
         factors.append(("资金费率多头拥挤", None, "无symbol跳过"))
 
     # 12. 持仓量配合（聪明钱·OI背离）
-    if symbol:
+    if derivatives_disabled:
+        factors.append(("持仓量配合看空", None, "降级模式(无衍生品历史)"))
+    elif symbol:
         oi_series = oi_series_override if oi_series_override is not None else fetch_oi_trend(symbol)
         if oi_series and len(oi_series) >= 5:
             oi_now = oi_series[-1]

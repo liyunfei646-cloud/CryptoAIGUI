@@ -37,6 +37,10 @@ MAX_HOLD_MS = 16 * 4 * 3600_000  # 16根4h = 64h
 RISK_PER_TRADE = 0.02            # 每笔风险 2%
 START_BALANCE = 1000.0
 
+# 纯技术面降级模式门槛（10 个技术因子，按 4/12≈33% 等比 → ≥3）
+# 注：降级跑长周期用；实盘仍是 12 因子 ≥4
+MIN_TECH_FACTORS = 3
+
 
 def fmt_ts(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, TZ).strftime("%m-%d %H:%M")

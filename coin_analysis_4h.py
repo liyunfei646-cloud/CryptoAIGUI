@@ -2,9 +2,15 @@
 """
 🐚 4h做空信号检查 - QQ机器人专用
 ========================================
+⚠️ 2026-09-24 V3.1 改造：输出加入【统计验证 + Trade Permission】段落。
+   依据：90天 OOS Net PF 全 <1、置换检验 p=0.316~0.978（远未过 0.05）、
+   劣于或平于纯趋势基线 → 按 9/20 立法「未证明正期望即禁实盘」，一律 NO TRADE。
+   因子列表与 Signal Score 仅作【描述性】展示，不等于交易许可。
+   门槛数据源：v31_gate.json（由 build_gate.py 从 backtest_v31.py 报告生成）。
+
 基于 2026-07-31 回测验证结论：
 - 15m 信号≈随机（48-51%）→ 废弃
-- 4h 做空因子命中 65-83% → 唯一可交易信号
+- 4h 做空因子命中 65-83% → 仅方向命中率，不构成正期望（见上）
 - 山寨币做多因子反向 → 禁止做多
 
 用法:
@@ -35,11 +41,52 @@ except Exception:
 
 INTERVAL = "4h"
 MIN_FACTORS = 4
-MAX_CHARS = 1600
+MAX_CHARS = 2000
+GATE_PATH = os.path.join(SCRIPT_DIR, "v31_gate.json")
+
+
+def load_gate(symbol: str):
+    """读取 V3.1 统计闸门数据（缺失/失效 → None，调用方按 NO TRADE 处理）。"""
+    try:
+        with open(GATE_PATH, encoding="utf-8") as f:
+            return json.load(f).get(symbol.upper())
+    except Exception:
+        return None
+
+
+def truncate_report(text: str, max_chars: int = MAX_CHARS) -> str:
+    """保头保尾截断：Trade Permission 块必须在尾部完整保留（修复旧版保头裁尾）。"""
+    if len(text) <= max_chars:
+        return text
+    lines = text.split("\n")
+    tail_start = next((i for i, l in enumerate(lines) if "Trade Permission" in l), None)
+    if tail_start is None:
+        tail_start = max(0, len(lines) - 5)
+    tail = lines[max(0, tail_start - 1):]
+    tail_txt = "\n".join(tail)
+    budget = max_chars - len(tail_txt) - 12
+    head = []
+    for l in lines[:tail_start]:
+        if len("\n".join(head + [l])) > budget:
+            break
+        head.append(l)
+    return "\n".join(head) + "\n  …（中略）\n" + tail_txt
 
 # 已验证的山寨币（禁止做多）— 其他币默认按"非山寨"处理
 ALTS = {"SPCX", "AERGO", "BANK", "XNY", "ZEREBRO", "CHR", "NIL", "DYDX", "TON",
         "ONDO", "PSG", "LAYER", "SUI", "OSMO", "CATI", "CHIP", "HMSTR", "KERNEL"}
+
+# ── §7 去相关：把 12 个因子按「共用原始数据」归并为 6 个独立证据簇 ──
+# 原 12 因子中，均线族/结构族/形态族/动量族/衍生品族存在同一份原始数据被重复计票的问题。
+# 簇内任一成员达标即视为该簇达标（同一证据的不同表述）。
+# 簇索引按 factors 列表下标（0-based）：
+#   0 RSI(动量) 1 EMA排列(趋势) 2 价格<EMA20(趋势) 3 下跌结构(结构) 4 看跌形态(形态)
+#   5 24h高位(结构) 6 MACD柱(动量) 7 MACD顶背离(动量) 8 放量看跌(形态)
+#   9 缩量上涨(量能) 10 资金费率(衍生品) 11 OI(衍生品)
+FACTOR_CLUSTERS = [
+    ("趋势", [1, 2]), ("结构", [3, 5]), ("形态", [4, 8]),
+    ("量能", [9]), ("动量", [0, 6, 7]), ("衍生品", [10, 11]),
+]
 
 
 def leverage_for_atr(atr_pct, confidence):
@@ -328,11 +375,27 @@ def compute_short_factors(klines, interval_minutes=240, symbol=None,
     triggered = [name for name, ok, _ in valid if ok]
     n_hit = len(triggered)
     confidence = 50 + (n_hit / len(factors)) * 50
+
+    # ── §7 去相关：独立证据簇计分 ──
+    clusters, cl_hit, cl_total = [], 0, 0
+    for cname, idxs in FACTOR_CLUSTERS:
+        states = [factors[i][1] for i in idxs if i < len(factors)]
+        states = [s for s in states if s is not None]
+        if not states:
+            clusters.append((cname, None))
+            continue
+        ok = any(states)
+        clusters.append((cname, ok))
+        cl_total += 1
+        if ok:
+            cl_hit += 1
+
     return {
         "n_hit": n_hit, "triggered": triggered, "factors": factors,
         "atr_pct": atr_pct, "confidence": confidence,
         "rsi": rsi_val, "range_pct": range_pct, "price": price,
         "n_total": len(valid),
+        "clusters": clusters, "n_cluster_hit": cl_hit, "n_cluster_total": cl_total,
     }
 
 
@@ -379,8 +442,12 @@ def build_report(symbol: str) -> str:
         lines.append("⚠️ 上线不足200根，EMA200因子降级（EMA20<50替代）")
     lines.append("")
 
-    status = "✅ 可入场做空" if n_hit >= MIN_FACTORS else "⛔ 观望"
-    lines.append(f"{status} ({n_hit}/{n_total} 因子，需≥{MIN_FACTORS})")
+    status = "✅ 因子达标" if n_hit >= MIN_FACTORS else "⛔ 因子未达标"
+    lines.append(f"{status} ({n_hit}/{n_total} 因子，阈值≥{MIN_FACTORS})  ← 描述性，非交易许可")
+    lines.append(f"Signal Score: {round(n_hit / max(1, n_total) * 100)}/100  (score，非概率)")
+    if sig.get("n_cluster_total"):
+        cl_txt = " ".join(f"{n}{'✓' if ok else '✗'}" for n, ok in sig["clusters"] if ok is not None)
+        lines.append(f"独立证据簇(§7去相关): {sig['n_cluster_hit']}/{sig['n_cluster_total']}  {cl_txt}")
     lines.append("─" * 24)
     for name, ok, detail in sig["factors"]:
         if ok is None:
@@ -390,7 +457,7 @@ def build_report(symbol: str) -> str:
             lines.append(f"  {mark} {name} ({detail})")
     lines.append("")
     if n_hit >= MIN_FACTORS:
-        lines.append(f"建议杠杆: {lev}x (置信度{conf:.0f})")
+        lines.append(f"参考杠杆: {lev}x")
         lines.append(f"止损(ATR): {sl_price:.6g} (+{sl_pct:.1f}%)")
         lines.append(f"止盈(ATR): {tp_price:.6g} (-{tp_pct:.1f}%)")
         # V2.0 结构止损对照
@@ -399,7 +466,24 @@ def build_report(symbol: str) -> str:
         lines.append(f"止盈(结构): {struct['tp_price']:.6g} (-{struct['tp_pct']:.1f}%)  → TP2 {struct['tp2_price']:.6g}")
         lines.append(f"最大持仓: 16根4h (≈2.7天)")
     else:
-        lines.append("📌 无信号不交易。今天不做，明天还有机会。")
+        lines.append("📌 因子未达标（描述性结论）")
+
+    # ── 统计验证 + 交易许可（V3.1 §11/§12）──
+    gate = load_gate(symbol)
+    lines.append("")
+    lines.append("── 统计验证（V3.1 / 90天 OOS）──")
+    if gate:
+        lines.append(f"历史样本: {gate['n']} 笔 | 历史胜率: {gate['win_rate']}%")
+        lines.append(f"Gross PF: {gate['gross_pf']} → Net PF(基准成本): {gate['net_pf']}  CI95 {gate['net_pf_ci']}")
+        lines.append(f"期望值: {gate['ev_per_trade']:+.4f}%/笔 | 交易成本: 约{gate['cost_pct']:.3f}%")
+        lines.append(f"纯趋势基线 Net PF: {gate['trend_pf']} (同区间/同成本)")
+        lines.append(f"置换检验 p={gate['p_perm']} / 随机方向 p={gate['p_rand']}（需<0.05）")
+        perm = "✅ TRADE" if gate.get("verdict") else "⛔ NO TRADE"
+    else:
+        lines.append("⚠ 无验证数据（未接入 v31_gate.json）")
+        perm = "⛔ NO TRADE"
+    lines.append(f"Trade Permission: {perm}")
+    lines.append("依据: 9/20 立法 — 未证明正期望即禁实盘")
 
     lines.append("")
     if is_alt:
@@ -429,14 +513,7 @@ def main():
         print(result)
         return
 
-    lines = result.split('\n')
-    kept = []
-    for line in lines:
-        kept.append(line)
-        if len('\n'.join(kept)) > MAX_CHARS:
-            kept.pop()
-            break
-    print('\n'.join(kept))
+    print(truncate_report(result, MAX_CHARS))
 
 
 if __name__ == "__main__":

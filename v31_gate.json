@@ -1,0 +1,74 @@
+{
+ "BTCUSDT": {
+  "source": "backtest_v31_report_dedup2.json | 90天 OOS | 基准成本",
+  "n": 163,
+  "win_rate": 41.7,
+  "gross_pf": 0.579,
+  "net_pf": 0.458,
+  "net_pf_ci": [
+   0.327,
+   0.643
+  ],
+  "ev_per_trade": -0.4021,
+  "cost_pct": 0.1177,
+  "trend_pf": 1.157,
+  "p_perm": 1.0,
+  "p_rand": 1.0,
+  "verdict": false,
+  "generated": "2026-09-24 15:07"
+ },
+ "ETHUSDT": {
+  "source": "backtest_v31_report_dedup2.json | 90天 OOS | 基准成本",
+  "n": 172,
+  "win_rate": 36.0,
+  "gross_pf": 0.508,
+  "net_pf": 0.426,
+  "net_pf_ci": [
+   0.3,
+   0.593
+  ],
+  "ev_per_trade": -0.5794,
+  "cost_pct": 0.1209,
+  "trend_pf": 1.423,
+  "p_perm": 0.98,
+  "p_rand": 1.0,
+  "verdict": false,
+  "generated": "2026-09-24 15:07"
+ },
+ "SOLUSDT": {
+  "source": "backtest_v31_report_dedup2.json | 90天 OOS | 基准成本",
+  "n": 187,
+  "win_rate": 39.6,
+  "gross_pf": 0.581,
+  "net_pf": 0.468,
+  "net_pf_ci": [
+   0.33,
+   0.644
+  ],
+  "ev_per_trade": -0.5792,
+  "cost_pct": 0.164,
+  "trend_pf": 1.342,
+  "p_perm": 0.994,
+  "p_rand": 1.0,
+  "verdict": false,
+  "generated": "2026-09-24 15:07"
+ },
+ "SPCXUSDT": {
+  "source": "backtest_v31_report_dedup2.json | 90天 OOS | 基准成本",
+  "n": 193,
+  "win_rate": 49.7,
+  "gross_pf": 0.846,
+  "net_pf": 0.546,
+  "net_pf_ci": [
+   0.39,
+   0.756
+  ],
+  "ev_per_trade": -0.5792,
+  "cost_pct": 0.4157,
+  "trend_pf": 0.7,
+  "p_perm": 0.914,
+  "p_rand": 0.826,
+  "verdict": false,
+  "generated": "2026-09-24 15:07"
+ }
+}

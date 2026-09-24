@@ -46,7 +46,9 @@ N_MC = 500           # Randomization / Bootstrap 次数
 MIN_TRAIN_TRADES = 5
 MIN_SIG = int(os.environ.get("MIN_SIG", MIN_TECH_FACTORS))   # 信号因子门槛（生产=4）
 SPAN_MODE = os.environ.get("SPAN_MODE", "exact")             # exact=严格days窗 / legacy=旧口径
-SUFFIX = f"_sig{MIN_SIG}" + ("_legacy" if SPAN_MODE == "legacy" else "")
+DEDUP = os.environ.get("DEDUP", "0") == "1"                  # 1=用去相关证据簇计分
+MIN_CLUSTER = int(os.environ.get("MIN_CLUSTER", 2))          # 簇门槛（6 簇中）
+SUFFIX = (f"_dedup{MIN_CLUSTER}" if DEDUP else f"_sig{MIN_SIG}") + ("_legacy" if SPAN_MODE == "legacy" else "")
 
 # ── 成本分档（bp，1bp = 0.01%）─────────────────────────────────
 TIER1 = {"BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT"}
@@ -279,6 +281,7 @@ def run_symbol(symbol: str, days: int) -> dict:
             regime = "CHAOS"
         cand.append({"i": len(cand), "t": t, "price": sig["price"], "atr_pct": sig["atr_pct"],
                      "n_hit": sig["n_hit"], "n_total": sig["n_total"], "regime": regime,
+                     "cl": sig.get("n_cluster_hit", 0), "cl_total": sig.get("n_cluster_total", 0),
                      "path": path_after(t)})
 
     print(f"  候选: {len(cand)} 个（n_hit≥{MIN_SIG}: "
@@ -327,10 +330,11 @@ def run_symbol(symbol: str, days: int) -> dict:
         train_c = [c for c in cand if tr0 <= c["t"] < tr1]
         test_c = [c for c in cand if te0 <= c["t"] < te1]
 
+        cf = (lambda c, mf: c["cl"] >= mf) if DEDUP else (lambda c, mf: c["n_hit"] >= mf)
         best = None
         for sm, tm in grid:
             for mf in minfac_grid:
-                rows = [build_trade(c, -1, sm, tm) for c in train_c if c["n_hit"] >= mf]
+                rows = [build_trade(c, -1, sm, tm) for c in train_c if cf(c, mf)]
                 if len(rows) < MIN_TRAIN_TRADES:
                     continue
                 m = metrics(rows)
@@ -338,10 +342,10 @@ def run_symbol(symbol: str, days: int) -> dict:
                 if best is None or score > best[0]:
                     best = (score, sm, tm, mf, m)
         sel = (best[1], best[2], best[3]) if best else (1.0, 1.0, MIN_SIG)
-        win_rows = [build_trade(c, -1, sel[0], sel[1]) for c in test_c if c["n_hit"] >= sel[2]]
+        win_rows = [build_trade(c, -1, sel[0], sel[1]) for c in test_c if cf(c, sel[2])]
         if len(win_rows) < 3:      # 选中参数在测试窗样本过少 → 回退生产默认
             sel = (1.0, 1.0, MIN_SIG)
-            win_rows = [build_trade(c, -1, sel[0], sel[1]) for c in test_c if c["n_hit"] >= sel[2]]
+            win_rows = [build_trade(c, -1, sel[0], sel[1]) for c in test_c if cf(c, sel[2])]
         m = with_gross(win_rows, metrics(win_rows))
         windows.append({"train": [fmt_ts(tr0), fmt_ts(tr1)], "test": [fmt_ts(te0), fmt_ts(te1)],
                         "params": {"sl": sel[0], "tp": sel[1], "min_factors": sel[2]},
@@ -355,7 +359,7 @@ def run_symbol(symbol: str, days: int) -> dict:
     # ── OOS-Default：生产参数（1.0×ATR / 1.0×ATR / 因子≥3），不做任何拟合 ──
     oos_range = ((windows[0]["test"][0], windows[-1]["test"][1]) if windows
                  else (fmt_ts(start), fmt_ts(end)))
-    oos_c = [c for c in cand if c["n_hit"] >= MIN_SIG
+    oos_c = [c for c in cand if ((c["cl"] >= MIN_CLUSTER) if DEDUP else (c["n_hit"] >= MIN_SIG))
              and oos_range[0] <= fmt_ts(c["t"]) < oos_range[1]]
     oos = [build_trade(c, -1, 1.0, 1.0) for c in oos_c]
     oos_pairs = [(c, 1.0, 1.0) for c in oos_c]

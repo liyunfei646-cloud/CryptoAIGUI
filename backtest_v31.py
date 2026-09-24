@@ -385,8 +385,11 @@ def run_symbol(symbol: str, days: int) -> dict:
             rand_pfs.append(m["pf"])
         rand_avgs.append(m["avg_ret"])
     rand_pfs.sort()
+    _pf = m_oos["pf"]
     base["random_ind"] = {
         "n_mc": len(rand_pfs),
+        "p_value": (round(sum(1 for p in rand_pfs if p >= (_pf or 0)) / len(rand_pfs), 4)
+                    if rand_pfs and _pf else None),
         "pf_mean": round(statistics.fmean(rand_pfs), 3) if rand_pfs else None,
         "pf_p05": round(rand_pfs[int(0.05*len(rand_pfs))], 3) if rand_pfs else None,
         "pf_p95": round(rand_pfs[int(0.95*len(rand_pfs))], 3) if rand_pfs else None,
@@ -411,6 +414,8 @@ def run_symbol(symbol: str, days: int) -> dict:
         perm_pfs.sort()
         base["permutation"] = {
             "mode": "true_permutation",
+            "p_value": (round(sum(1 for p in perm_pfs if p >= (_pf or 0)) / len(perm_pfs), 4)
+                        if perm_pfs and _pf else None),
             "pf_mean": round(statistics.fmean(perm_pfs), 3) if perm_pfs else None,
             "pf_p05": round(perm_pfs[int(0.05*len(perm_pfs))], 3) if perm_pfs else None,
             "pf_p95": round(perm_pfs[int(0.95*len(perm_pfs))], 3) if perm_pfs else None,
@@ -432,6 +437,8 @@ def run_symbol(symbol: str, days: int) -> dict:
         perm_pfs.sort()
         base["permutation"] = {
             "mode": "timing_permutation_B_prime（方向单一，真置换退化为恒等）",
+            "p_value": (round(sum(1 for p in perm_pfs if p >= (_pf or 0)) / len(perm_pfs), 4)
+                        if perm_pfs and _pf else None),
             "pf_mean": round(statistics.fmean(perm_pfs), 3) if perm_pfs else None,
             "pf_p05": round(perm_pfs[int(0.05*len(perm_pfs))], 3) if perm_pfs else None,
             "pf_p95": round(perm_pfs[int(0.95*len(perm_pfs))], 3) if perm_pfs else None,
@@ -477,6 +484,31 @@ def run_symbol(symbol: str, days: int) -> dict:
         if rows:
             regime_buckets[reg] = with_gross(rows, metrics(rows))
 
+    # ── 月度分桶（跨时间稳定性）──
+    monthly = {}
+    for mk in sorted({datetime.fromtimestamp(r["t"] / 1000, TZ).strftime("%Y-%m") for r in oos}):
+        rows = [r for r in oos if datetime.fromtimestamp(r["t"] / 1000, TZ).strftime("%Y-%m") == mk]
+        if rows:
+            monthly[mk] = metrics(rows)
+
+    # ── 验收判定（§13 六条 + 概率）──
+    trend_m = with_gross(trend_rows, metrics(trend_rows))
+    sens_base, sens_cons = sens["base"], sens["conservative"]
+    ci_lo_v = ci_lo if ci_lo is not None else -1
+    p_perm_v = base["permutation"].get("p_value")
+    p_rand_v = base["random_ind"].get("p_value")
+    verdict = {
+        "①跨时间稳定": all(mm["pf"] is not None and mm["pf"] > 1 for mm in monthly.values()),
+        "②扣成本成立": (sens_base["pf"] or 0) > 1 and (sens_cons["pf"] or 0) > 1,
+        "③WF稳定": (m_wf["pf"] or 0) > 1 and (wf_ci[0] or -1) > 1,
+        "④优于纯趋势": (m_oos["pf"] or 0) > (trend_m["pf"] or 0),
+        "⑤随机化通过": (p_perm_v is not None and p_perm_v < 0.05),
+        "⑥随机方向通过": (p_rand_v is not None and p_rand_v < 0.05),
+        "⑦NetPF>1且CI下界>1": (m_oos["pf"] or 0) > 1 and ci_lo_v > 1,
+        "⑧概率已校准": False,
+    }
+    verdict["总体"] = all(verdict.values())
+
     return {
         "symbol": symbol, "days": days, "tier": tier,
         "decision_points": len(cand),
@@ -486,6 +518,7 @@ def run_symbol(symbol: str, days: int) -> dict:
         "oos_default_metrics": {**m_oos, "ci95_net_pf": [ci_lo, ci_hi]},
         "oos_range": oos_range,
         "baselines": base, "cost_sensitivity": sens, "regime_buckets": regime_buckets,
+        "monthly": monthly, "verdict": verdict, "trend_metrics": trend_m,
         "oos_trades": oos,
     }
 
@@ -526,10 +559,10 @@ def print_symbol_report(s, r):
     ri = b["random_ind"]
     print(f"    Mode A 随机方向: PF均值 {ri['pf_mean']} [P5 {ri['pf_p05']} ~ P95 {ri['pf_p95']}] "
           f"min{ri['pf_min']} max{ri['pf_max']} | avg {ri['avg_mean']:+.4f}% "
-          f"| 策略优于随机比例 {ri['pct_strategy_beats']}%")
+          f"| p值 {ri['p_value']}（策略优于随机比例 {ri['pct_strategy_beats']}%）")
     pb = b["permutation"]
     print(f"    Mode B {pb['mode']}: PF均值 {pb['pf_mean']} [P5 {pb['pf_p05']} ~ P95 {pb['pf_p95']}] "
-          f"| 策略优于置换比例 {pb['pct_strategy_beats']}%")
+          f"| p值 {pb['p_value']}（策略优于置换比例 {pb['pct_strategy_beats']}%）")
     bh = b["bh"]
     if bh:
         print(f"    Buy&Hold {bh['buy_hold_pct']:+.2f}% | Short&Hold {bh['short_hold_pct']:+.2f}% "
@@ -546,6 +579,18 @@ def print_symbol_report(s, r):
     print("\n【五】Regime 分桶（OOS，base 成本）")
     for reg, m in r["regime_buckets"].items():
         print(_fmt_m(m, f"{reg:<12}"))
+
+    print("\n【六】月度分桶（跨时间稳定性）")
+    for mk, m in r["monthly"].items():
+        pf = f"{m['pf']:.2f}" if m.get("pf") is not None else "-"
+        print(f"    {mk}: n={m['n']:<4} 胜率{m['win_rate']:<6} NetPF {pf:>6} | avg {m['avg_ret']:+.4f}%")
+
+    print("\n【七】验收判定（§13）")
+    for k, ok in r["verdict"].items():
+        if k == "总体":
+            continue
+        print(f"    {'✅' if ok else '❌'} {k}")
+    print(f"    → 总体：{'✅ 通过' if r['verdict']['总体'] else '❌ 未通过（未证明存在 Alpha）'}")
 
 
 def main():
@@ -577,14 +622,16 @@ def main():
     print("\n" + "=" * 80)
     print("  V3.1 汇总（OOS-Default）")
     print("=" * 80)
-    print(f"  {'币种':<9}{'n':>4}{'胜率':>7}{'GrossPF':>9}{'NetPF':>8}{'NetPF_CI95':>18}{'avg净%':>9}{'回撤%':>8}")
+    print(f"  {'币种':<9}{'n':>4}{'胜率':>7}{'GrossPF':>9}{'NetPF':>8}{'NetPF_CI95':>18}{'avg净%':>9}{'回撤%':>8}{'p置换':>8}{'判定':>8}")
     for s, r in out.items():
         m = r["oos_default_metrics"]
         ci = m["ci95_net_pf"]
         pf = f"{m['pf']:.2f}" if m["pf"] is not None else "inf"
         gpf = f"{m['gross_pf']:.2f}" if m.get("gross_pf") is not None else "-"
+        pv = r["baselines"]["permutation"].get("p_value")
         print(f"  {s:<9}{m['n']:>4}{m['win_rate']:>7}{gpf:>9}{pf:>8}"
-              f"{str(ci):>18}{m['avg_ret']:>+9.4f}{m['max_dd_pct']:>8}")
+              f"{str(ci):>18}{m['avg_ret']:>+9.4f}{m['max_dd_pct']:>8}"
+              f"{str(pv):>8}{'通过' if r['verdict']['总体'] else '未通过':>8}")
 
 
 if __name__ == "__main__":

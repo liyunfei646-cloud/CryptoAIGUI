@@ -1,4 +1,6 @@
 backtest_*.json
+# V3.1 验证报告是结论证据，入库（其余回测明细仍忽略）
+!backtest_v31_report*.json
 signals/
 
 # --- secrets & agent local state ---

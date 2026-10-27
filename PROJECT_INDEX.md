@@ -1,6 +1,6 @@
 # PROJECT_INDEX — 文件地图与作用说明
 
-> 生成：2026-10-27 ｜ 基线：`d581330`（V3.1 P1 收口）｜ 维护规则：新增/重命名文件必须同步更新本文件
+> 生成：2026-10-27 ｜ 基线：`8cda0cd`（V3.1 P1 收口 + 报告入库）｜ 维护规则：新增/重命名文件必须同步更新本文件
 >
 > **项目当前状态：V3.1 验收 8/8 未通过 → 4h 做空系统实盘闸门为 `NO TRADE`。**
 > 本仓库中「生产」= 会给用户输出结论；「研究」= 只用于验证/证伪，不产生交易许可。
@@ -126,7 +126,7 @@ python3 backtest_v2.py --tech-only BTCUSDT 60
 
 ## 7. 数据文件（`backtest_*.json`）
 
-> 注意：`.gitignore` 已忽略 `backtest_*.json`，下面这些是**历史上已跟踪**的样本文件；新回测产物默认不入库。
+> 注意：`.gitignore` 忽略 `backtest_*.json`，但用 `!backtest_v31_report*.json` 给 **V3.1 验证报告**开了白名单——它们是「NO TRADE」判词的原始证据，必须可追溯。其余逐笔明细仍不入库。
 
 | 文件 | 产出脚本 | 内容 |
 |---|---|---|
@@ -135,7 +135,12 @@ python3 backtest_v2.py --tech-only BTCUSDT 60
 | `backtest_{SYM}_20d_trend_up_long.json` | `backtest_v2.py`（experiment=`trend_up_long`） | V2.1 顺势做多域 20 天明细 |
 | `backtest_{SYM}_3d_baseline.json` | `backtest_v2.py` | 3 天 baseline 冒烟测试 |
 | `backtest_{SYM}_60d_baseline.json` | `backtest_v2.py --tech-only` | 60 天纯技术面 baseline |
-| `backtest_v31_report*.json` | `backtest_v31.py` | 仅本地保留（体积大，不入库）：`_sig3` / `_sig4` / `_dedup2` / `_dedup3` / `_legacy` |
+| `backtest_v31_report.json` | `backtest_v31.py`（10:55 首轮） | 早期口径，仅 ETH/SOL/SPCX 三币（BTC 缺），NetPF≈0.14；已入库，仅存档 |
+| `backtest_v31_report_sig4.json` | `backtest_v31.py`（11:00，MIN_SIG=4） | 严格 90 天截窗，V31_REPORT 文档表格口径的来源 |
+| `backtest_v31_report_sig4_legacy.json` | `backtest_v31.py`（11:04，SPAN_MODE=legacy） | 旧 ~114 天跨度，仅用于复现旧表（单币 BTC），**不作结论依据** |
+| `backtest_v31_report_sig3.json` | `backtest_v31.py`（14:49，MIN_SIG=3） | V31_VERDICT 主结果表来源（BTC n=77 / NetPF 0.42 / 胜率 37.7%） |
+| `backtest_v31_report_dedup2.json` | `backtest_v31.py`（15:04，DEDUP + MIN_CLUSTER=2） | §7 去相关（6 证据簇）结果，**`v31_gate.json` 的数据源**（BTC n=163 / NetPF 0.458） |
+| `backtest_v31_report_dedup3.json` | `backtest_v31.py`（15:10，MIN_CLUSTER=3） | 更严簇门槛对照（BTC n=48 / NetPF 0.264），证明收紧后更差 |
 | `v31_gate.json` | `build_gate.py` | 闸门结果（**入库**，生产依赖） |
 
 `signals/` — 运行时审计存储（JSONL + cron.log），已 gitignore，不入库。
@@ -158,7 +163,7 @@ python3 backtest_v2.py --tech-only BTCUSDT 60
 |---|---|---|
 | API 密钥 | 本地明文文件（如 `binance_api_keys.md`） | **禁止入库**；仓库为公开仓库，`.gitignore` 已加 `*api_keys*`/`*keys*.json`/`.env` |
 | 长期记忆/会话状态 | `~/.openclaw/workspace/`（OpenClaw 工作区） | 与代码仓库分离 |
-| 大体积回测报告 | 本地 `backtest_v31_report*.json` | 需要共享时走 Release 或对象存储，不进 main |
+| 大体积逐笔明细 | 本地 `backtest_4h_*/backtest_<SYM>_*d.json` | `backtest_*.json` 整体忽略；V3.1 报告已按白名单入库，后续新增大报告建议走 Release |
 | 运行日志 | `signals/`、`*.log` | 已忽略 |
 
 ---

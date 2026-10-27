@@ -1,2 +1,9 @@
 backtest_*.json
 signals/
+
+# --- secrets & agent local state ---
+binance_api_keys.md
+*api_keys*.md
+*keys*.json
+.openclaw/
+.clawhub/
